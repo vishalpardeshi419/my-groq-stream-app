@@ -3,20 +3,39 @@
 import { useState } from "react";
 import { Square, Send } from "lucide-react";
 import { useChat } from "@ai-sdk/react";
-import { TextStreamChatTransport } from "ai";
+import { DefaultChatTransport, type UIMessage } from "ai";
+
+type TokenAuditMetrics = {
+  chatId: string;
+  requestedAt: string;
+  latencyMs: number;
+  status: "completed" | "aborted" | "failed" | "rejected";
+  estimatedInputTokens: number | null;
+  inputTokens: number | null;
+  outputTokens: number | null;
+  partialOutputTokenEstimate?: number;
+};
+
+type ChatData = { "token-audit": TokenAuditMetrics };
 
 export default function ChatComponent() {
   const [input, setInput] = useState("");
+  const [auditMetrics, setAuditMetrics] = useState<TokenAuditMetrics | null>(null);
   const {
     messages,
     sendMessage,
     stop,
     status,
     error,
-  } = useChat({
-    transport: new TextStreamChatTransport({ api: "/api/chat" }),
+  } = useChat<UIMessage<unknown, ChatData>>({
+    transport: new DefaultChatTransport({ api: "/api/chat" }),
     onError: (err) => {
       console.error("UI Stream disconnect:", err);
+    },
+    onData(dataPart) {
+      if (dataPart.type === "data-token-audit") {
+        setAuditMetrics(dataPart.data);
+      }
     },
   });
 
@@ -30,6 +49,26 @@ export default function ChatComponent() {
           Supports AbortController cancellation & partial state handling
         </p>
       </header>
+
+      {auditMetrics && (
+        <section
+          aria-label="Latest request token metrics"
+          aria-live="polite"
+          className="grid grid-cols-2 gap-x-6 gap-y-1 border-b pb-3 mb-4 text-xs text-gray-600 dark:text-gray-400 sm:grid-cols-3"
+        >
+          <span>
+            Input: {auditMetrics.inputTokens ?? auditMetrics.estimatedInputTokens ?? "N/A"}
+            {auditMetrics.inputTokens == null ? " estimated" : " tokens"}
+          </span>
+          <span>
+            Output: {auditMetrics.outputTokens ?? auditMetrics.partialOutputTokenEstimate ?? "N/A"}
+            {auditMetrics.outputTokens == null ? " estimated" : " tokens"}
+          </span>
+          <span>Latency: {auditMetrics.latencyMs} ms</span>
+          <span>Status: {auditMetrics.status}</span>
+          <span>Requested: {new Date(auditMetrics.requestedAt).toLocaleString()}</span>
+        </section>
+      )}
 
       {/* Messages Feed */}
       <div className="flex-1 overflow-y-auto space-y-4 pr-2">
@@ -72,6 +111,7 @@ export default function ChatComponent() {
           event.preventDefault();
           const text = input.trim();
           if (!text || isLoading) return;
+          setAuditMetrics(null);
           sendMessage({ text });
           setInput("");
         }}
