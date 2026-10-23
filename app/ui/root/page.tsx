@@ -1,11 +1,12 @@
 'use client';
 
 import { useState } from "react";
-import { Square, Send } from "lucide-react";
+import { FileText, Square, Send } from "lucide-react";
 import { useChat } from "@ai-sdk/react";
 import { DefaultChatTransport, type UIMessage } from "ai";
 
 type TokenAuditMetrics = {
+  requestId: string;
   chatId: string;
   requestedAt: string;
   latencyMs: number;
@@ -44,10 +45,21 @@ export default function ChatComponent() {
   return (
     <div className="flex flex-col h-screen max-w-3xl mx-auto p-4">
       <header className="py-4 border-b mb-4">
-        <h1 className="text-xl font-bold">Groq + Next.js Streaming Chat</h1>
-        <p className="text-xs text-gray-500">
-          Supports AbortController cancellation & partial state handling
-        </p>
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <h1 className="text-xl font-bold">Groq + Next.js Streaming Chat</h1>
+            <p className="text-xs text-gray-500">
+              Supports AbortController cancellation & partial state handling
+            </p>
+          </div>
+          <a
+            href="/logs"
+            className="inline-flex h-9 items-center gap-2 border border-gray-300 px-3 text-sm hover:bg-gray-100 dark:border-gray-700 dark:hover:bg-gray-800"
+          >
+            <FileText aria-hidden="true" className="h-4 w-4" />
+            Logs
+          </a>
+        </div>
       </header>
 
       {auditMetrics && (

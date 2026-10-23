@@ -1,9 +1,8 @@
-import { groq } from "@ai-sdk/groq";
+import { randomUUID } from "node:crypto";
 import {
   convertToModelMessages,
   createUIMessageStream,
   createUIMessageStreamResponse,
-  streamText,
   toUIMessageStream,
   type ModelMessage,
   type UIMessage,
@@ -13,11 +12,15 @@ import {
   countTokens,
 } from "gpt-tokenizer/model/gpt-oss-120b";
 import type { ChatMessage } from "gpt-tokenizer/functionCalling";
+import {
+  LLM_MAX_OUTPUT_TOKENS,
+  logStructuredEvent,
+  streamLlm,
+} from "@/lib/llm";
 import { SYSTEM_PROMPTS } from "@/lib/prompts";
 
 export const maxDuration = 30; // Max execution time for serverless deployment
 
-const MAX_OUTPUT_TOKENS = 4_096;
 const MAX_CONTEXT_TOKENS = 131_072;
 const DEFAULT_INPUT_TOKEN_BUDGET = 120_000;
 const configuredInputTokenBudget = Number(
@@ -27,7 +30,7 @@ const MAX_INPUT_TOKENS =
   Number.isInteger(configuredInputTokenBudget) && configuredInputTokenBudget > 0
     ? Math.min(
         configuredInputTokenBudget,
-        MAX_CONTEXT_TOKENS - MAX_OUTPUT_TOKENS,
+        MAX_CONTEXT_TOKENS - LLM_MAX_OUTPUT_TOKENS,
       )
     : DEFAULT_INPUT_TOKEN_BUDGET;
 
@@ -61,6 +64,7 @@ function countInputTokens(messages: ModelMessage[]): number | null {
 }
 
 function logRequestMetrics(data: {
+  requestId: string;
   chatId: string;
   requestedAt: string;
   startedAt: number;
@@ -71,6 +75,7 @@ function logRequestMetrics(data: {
   partialOutputTokenEstimate?: number;
 }) {
   const metrics = {
+    requestId: data.requestId,
     chatId: data.chatId,
     requestedAt: data.requestedAt,
     latencyMs: Date.now() - data.startedAt,
@@ -80,7 +85,7 @@ function logRequestMetrics(data: {
     outputTokens: data.outputTokens ?? null,
     partialOutputTokenEstimate: data.partialOutputTokenEstimate,
   };
-  console.info("[TOKEN AUDIT]", metrics);
+  logStructuredEvent("llm.request.metrics", metrics);
   return metrics;
 }
 
@@ -91,7 +96,12 @@ async function saveMessageToDatabase(data: {
   content: string;
   status: "completed" | "cancelled" | "failed";
 }) {
-  console.log(`\n[DATABASE SAVE] (${data.status.toUpperCase()}):`, data);
+  logStructuredEvent("chat.message.persisted", {
+    chatId: data.chatId,
+    role: data.role,
+    status: data.status,
+    contentCharacters: data.content.length,
+  });
 }
 
 export async function POST(req: Request) {
@@ -100,6 +110,7 @@ export async function POST(req: Request) {
     chatId?: string;
   } = await req.json();
 
+  const requestId = randomUUID();
   const startedAt = Date.now();
   const requestedAt = new Date(startedAt).toISOString();
   const modelMessages = await convertToModelMessages(messages);
@@ -107,6 +118,7 @@ export async function POST(req: Request) {
 
   if (estimatedInputTokens === null) {
     logRequestMetrics({
+      requestId,
       chatId,
       requestedAt,
       startedAt,
@@ -122,6 +134,7 @@ export async function POST(req: Request) {
 
   if (estimatedInputTokens > MAX_INPUT_TOKENS) {
     logRequestMetrics({
+      requestId,
       chatId,
       requestedAt,
       startedAt,
@@ -151,6 +164,7 @@ export async function POST(req: Request) {
         if (metricsLogged) return;
         metricsLogged = true;
         const metrics = logRequestMetrics({
+          requestId,
           chatId,
           requestedAt,
           startedAt,
@@ -167,9 +181,10 @@ export async function POST(req: Request) {
         });
       };
 
-      const result = streamText({
-        model: groq("openai/gpt-oss-120b"),
-        maxOutputTokens: MAX_OUTPUT_TOKENS,
+      const result = streamLlm({
+        requestId,
+        chatId,
+        estimatedInputTokens,
         system: SYSTEM_PROMPTS.defaultAssistant,
         messages: modelMessages,
 
@@ -216,9 +231,15 @@ export async function POST(req: Request) {
           }
         },
 
-        onError(error) {
+        onError({ error }) {
           sendFinalMetrics("failed");
-          console.error("Groq Stream Error:", error);
+          logStructuredEvent("chat.generation.error", {
+            requestId,
+            chatId,
+            errorType: error instanceof Error ? error.name : typeof error,
+            errorMessage:
+              error instanceof Error ? error.message : undefined,
+          });
         },
       });
 
