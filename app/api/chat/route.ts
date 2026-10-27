@@ -3,25 +3,33 @@ import {
   convertToModelMessages,
   createUIMessageStream,
   createUIMessageStreamResponse,
+  isStepCount,
   toUIMessageStream,
-  type ModelMessage,
   type UIMessage,
 } from "ai";
-import {
-  countChatCompletionTokens,
-  countTokens,
-} from "gpt-tokenizer/model/gpt-oss-120b";
-import type { ChatMessage } from "gpt-tokenizer/functionCalling";
+import { countTokens } from "gpt-tokenizer/model/gpt-oss-120b";
 import {
   LLM_MAX_OUTPUT_TOKENS,
   logStructuredEvent,
   streamLlm,
 } from "@/lib/llm";
+import {
+  CHAT_TOOL_INSTRUCTIONS,
+  CHAT_TOOL_SCHEMAS,
+  createChatTools,
+} from "@/lib/chat-tools";
+import { MAX_TOOL_STEPS } from "@/lib/chat-tool-config";
+import {
+  estimateInputTokens,
+  isWithinInputTokenBudget,
+  TOKEN_PREFLIGHT_SAFETY_MARGIN,
+} from "@/lib/token-preflight";
 import { SYSTEM_PROMPTS } from "@/lib/prompts";
 
 export const maxDuration = 30; // Max execution time for serverless deployment
 
 const MAX_CONTEXT_TOKENS = 131_072;
+const CHAT_SYSTEM_PROMPT = `${SYSTEM_PROMPTS.defaultAssistant}\n\n${CHAT_TOOL_INSTRUCTIONS}`;
 const DEFAULT_INPUT_TOKEN_BUDGET = 120_000;
 const configuredInputTokenBudget = Number(
   process.env.MAX_INPUT_TOKENS ?? DEFAULT_INPUT_TOKEN_BUDGET,
@@ -30,38 +38,11 @@ const MAX_INPUT_TOKENS =
   Number.isInteger(configuredInputTokenBudget) && configuredInputTokenBudget > 0
     ? Math.min(
         configuredInputTokenBudget,
-        MAX_CONTEXT_TOKENS - LLM_MAX_OUTPUT_TOKENS,
+        MAX_CONTEXT_TOKENS -
+          LLM_MAX_OUTPUT_TOKENS -
+          TOKEN_PREFLIGHT_SAFETY_MARGIN,
       )
     : DEFAULT_INPUT_TOKEN_BUDGET;
-
-function getTextContent(message: ModelMessage): string | null {
-  if (typeof message.content === "string") return message.content;
-
-  let text = "";
-  for (const part of message.content) {
-    if (part.type !== "text") return null;
-    text += part.text;
-  }
-  return text;
-}
-
-function countInputTokens(messages: ModelMessage[]): number | null {
-  const tokenMessages: ChatMessage[] = [
-    { role: "system", content: SYSTEM_PROMPTS.defaultAssistant },
-  ];
-
-  for (const message of messages) {
-    const content = getTextContent(message);
-    if (content === null) return null;
-    tokenMessages.push({ role: message.role, content });
-  }
-
-  if (!countChatCompletionTokens) {
-    throw new Error("The gpt-oss tokenizer does not support chat token counts.");
-  }
-
-  return countChatCompletionTokens({ messages: tokenMessages });
-}
 
 function logRequestMetrics(data: {
   requestId: string;
@@ -69,6 +50,9 @@ function logRequestMetrics(data: {
   requestedAt: string;
   startedAt: number;
   estimatedInputTokens: number | null;
+  messageTokens?: number | null;
+  toolSchemaTokens?: number | null;
+  safetyMarginTokens?: number;
   status: "completed" | "aborted" | "failed" | "rejected";
   inputTokens?: number | null;
   outputTokens?: number | null;
@@ -81,6 +65,9 @@ function logRequestMetrics(data: {
     latencyMs: Date.now() - data.startedAt,
     status: data.status,
     estimatedInputTokens: data.estimatedInputTokens,
+    messageTokens: data.messageTokens ?? null,
+    toolSchemaTokens: data.toolSchemaTokens ?? null,
+    safetyMarginTokens: data.safetyMarginTokens ?? null,
     inputTokens: data.inputTokens ?? null,
     outputTokens: data.outputTokens ?? null,
     partialOutputTokenEstimate: data.partialOutputTokenEstimate,
@@ -114,9 +101,13 @@ export async function POST(req: Request) {
   const startedAt = Date.now();
   const requestedAt = new Date(startedAt).toISOString();
   const modelMessages = await convertToModelMessages(messages);
-  const estimatedInputTokens = countInputTokens(modelMessages);
+  const estimate = estimateInputTokens({
+    messages: modelMessages,
+    systemPrompt: CHAT_SYSTEM_PROMPT,
+    toolSchemas: CHAT_TOOL_SCHEMAS,
+  });
 
-  if (estimatedInputTokens === null) {
+  if (estimate === null) {
     logRequestMetrics({
       requestId,
       chatId,
@@ -127,18 +118,23 @@ export async function POST(req: Request) {
     });
 
     return Response.json(
-      { error: "Only text messages are supported by token preflight." },
+      { error: "Only text and tool messages are supported by token preflight." },
       { status: 400 },
     );
   }
 
-  if (estimatedInputTokens > MAX_INPUT_TOKENS) {
+  const estimatedInputTokens = estimate.estimatedInputTokens;
+
+  if (!isWithinInputTokenBudget(estimatedInputTokens, MAX_INPUT_TOKENS)) {
     logRequestMetrics({
       requestId,
       chatId,
       requestedAt,
       startedAt,
       estimatedInputTokens,
+      messageTokens: estimate.messageTokens,
+      toolSchemaTokens: estimate.toolSchemaTokens,
+      safetyMarginTokens: estimate.safetyMarginTokens,
       status: "rejected",
     });
 
@@ -146,6 +142,9 @@ export async function POST(req: Request) {
       {
         error: "Conversation exceeds the input token budget.",
         estimatedInputTokens,
+        messageTokens: estimate.messageTokens,
+        toolSchemaTokens: estimate.toolSchemaTokens,
+        safetyMarginTokens: estimate.safetyMarginTokens,
         maxInputTokens: MAX_INPUT_TOKENS,
       },
       { status: 413 },
@@ -169,6 +168,9 @@ export async function POST(req: Request) {
           requestedAt,
           startedAt,
           estimatedInputTokens,
+          messageTokens: estimate.messageTokens,
+          toolSchemaTokens: estimate.toolSchemaTokens,
+          safetyMarginTokens: estimate.safetyMarginTokens,
           status,
           inputTokens,
           outputTokens,
@@ -185,8 +187,10 @@ export async function POST(req: Request) {
         requestId,
         chatId,
         estimatedInputTokens,
-        system: SYSTEM_PROMPTS.defaultAssistant,
+        system: CHAT_SYSTEM_PROMPT,
         messages: modelMessages,
+        tools: createChatTools(chatId),
+        stopWhen: isStepCount(MAX_TOOL_STEPS),
 
         // Automatically forwards the user's AbortController signal.
         abortSignal: req.signal,
