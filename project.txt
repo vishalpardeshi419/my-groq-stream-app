@@ -1,0 +1,25 @@
+Project setup
+This is a Next.js chat application using React 19, TypeScript, and Tailwind CSS 4. Groq provides the language model through the AI SDK and Groq SDK; the configured model is openai/gpt-oss-120b. The project’s dependencies and commands are in package.json, and setup instructions are in README.md.
+
+Main features and services
+Chat UI: Available at /ui/root.
+PDF knowledge search (optional): Ingests a PDF, creates local 384-dimensional embeddings with a MiniLM model, and stores chunks in PostgreSQL with pgvector. Search combines vector and keyword results. The terminal query flow is implemented in query.ts and knowledge-base.ts.
+Tools and logs: The chat can use weather and recent-usage tools. Development logs are in-memory; chat messages are not persisted to a database.
+To run it
+Use Node.js 22 or newer and install packages with npm install.
+Add GROQ_API_KEY to .env.local. Add OPENWEATHER_API_KEY to enable weather, and DATABASE_URL if you want PDF search.
+For PDF search, start a local PostgreSQL database with pgvector, then run npm run ingest and npm run setup:hybrid-search.
+Start the app with npm run dev and open http://localhost:3000/ui/root.
+Useful commands: npm run lint, npx tsc --noEmit, and npm test.
+
+2:45 PM
+27s
+•
+Auto (gpt-6-luna) • 0.3 credits
+are we using Local modal to execute ?
+
+2:47 PM
+If you mean model: the chat model is not running locally. openai/gpt-oss-120b runs via Groq’s API.
+
+For PDF search, the MiniLM embedding model does run locally on CPU after it’s downloaded from Hugging Face. The app uses that local model to create and search document embeddings; Groq still generates the answer. See knowledge-base.ts and query.ts.
+
