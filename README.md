@@ -2,6 +2,10 @@
 
 A Next.js chat UI powered by Groq and the AI SDK. The chat interface is available at `/ui/root`; the root route (`/`) is still the default Next.js starter page.
 
+
+## confluence 
+- https://vpardeshi419.atlassian.net/wiki/spaces/~5ecf824d8d2e220c254b41c2/pages/131109/Groq+Chat+Application+Implementation+Summary
+
 ## Requirements
 
 - Node.js 22 or newer
@@ -34,6 +38,39 @@ npm run dev
 
 Open [http://localhost:3000/ui/root](http://localhost:3000/ui/root).
 Open [http://localhost:3000/logs](http://localhost:3000/logs) to view development runtime logs.
+
+## PDF ingestion
+
+The ingestion script reads `data/javascript.pdf` by default (or `app/data/javascript.pdf` if that is where the file is stored), chunks its text by paragraph into at most 180 tokenizer-estimated tokens to fit the local MiniLM model's input limit, generates normalized 384-dimensional embeddings on the CPU, and upserts them into a local PostgreSQL database with the pgvector extension. The model is downloaded from Hugging Face on first use; embedding generation then runs locally without an API key. `GROQ_API_KEY` is only used by chat.
+
+Add the database connection string to `.env.local`:
+
+```env
+DATABASE_URL=postgresql://postgres:postgres@localhost:5432/postgres
+```
+
+Run the script after starting your local pgvector Docker database:
+
+```bash
+npm run ingest
+# Or pass a different PDF path:
+npm run ingest -- ./data/another-document.pdf
+```
+
+The script creates a `document_chunks` table if needed, plus the generated `tsv` column and its GIN index for hybrid search. Re-running it for the same PDF source updates existing chunks and removes stale trailing chunks. An empty table with an older vector dimension is updated automatically; a populated table with incompatible embeddings is left untouched and must be re-embedded or backed up and recreated before ingestion. When using local embeddings for search, generate query vectors with this same model.
+
+## Terminal RAG query
+
+After ingesting a PDF, prepare PostgreSQL full-text search once and ask a question against the stored chunks using hybrid vector + keyword search:
+
+```bash
+npm run setup:hybrid-search
+npm run query -- "What are closures in JavaScript?"
+```
+
+The setup command adds full-text search to this app's `document_chunks` table. The SQL from the previous step uses a separate `chunks` table, so it will not enable full-text search for this app. The query script uses `GROQ_API_KEY` and `DATABASE_URL` from `.env.local`, combines the top 20 vector and keyword results with Reciprocal Rank Fusion (RRF), then prints an answer with chunk citations and retrieved sources. If no question is supplied, it defaults to `What are closures in JavaScript?`.
+
+The same retrieval is available in the chat UI at `/ui/root`. Leave **Use PDF knowledge base** checked to answer from the ingested PDF and see the retrieved source chunks; uncheck it for regular Groq chat.
 
 ## Chat behavior
 
