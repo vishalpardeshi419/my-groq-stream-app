@@ -7,7 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test": "tsx --test tests/agent-tools.test.ts tests/token-preflight.test.ts tests/weather.test.ts"
+    "test": "tsx --test tests/agent-tools.test.ts tests/agent-tool-executor.test.ts tests/token-preflight.test.ts tests/weather.test.ts"
   },
   "dependencies": {
     "@ai-sdk/groq": "^4.0.63",

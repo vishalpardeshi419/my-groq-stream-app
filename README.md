@@ -42,8 +42,9 @@ Open [http://localhost:3000/logs](http://localhost:3000/logs) to view developmen
 - You can stop an in-progress response; the request's abort signal is forwarded to the model stream.
 - The route currently uses `openai/gpt-oss-120b` and the default assistant prompt in `lib/prompts.ts`.
 - `lib/llm.ts` centralizes the Groq model, output-token limit, SDK call, and LLM lifecycle logging.
-- The model can call `get_weather` for current conditions from OpenWeather and `get_recent_usage` for recent usage metrics from the current chat's development logs.
-- Tool execution is limited to five model steps per request. Tool failures are returned to the model as structured results so it can explain the issue.
+- The model can call `get_weather` for current conditions from OpenWeather and `get_recent_usage` for recent usage metrics from the current chat's development logs. It can execute up to five calls concurrently in a step.
+- The assistant gives a brief user-facing plan before tool work and adapts its next action to each result without exposing private chain-of-thought. Exact repeated tool calls are not re-executed; the prior result and a request to try another approach are returned to the model.
+- Tool failures are returned to the model as structured error results so it can explain the issue or recover. The model naturally ends when the task is complete; execution also has an eight-step and run-token safety limit per request.
 - Message persistence is a mock: lifecycle hooks log completed or cancelled assistant responses to the server console. No database is configured.
 
 ## Token auditing

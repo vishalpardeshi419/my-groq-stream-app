@@ -205,6 +205,7 @@ export async function POST(req: Request) {
         system: CHAT_SYSTEM_PROMPT,
         messages: modelMessages,
         tools: createChatTools(chatId),
+        toolCallConcurrency: 5,
         stopWhen: [
           isStepCount(MAX_TOOL_STEPS),
           ({ steps }) => {
