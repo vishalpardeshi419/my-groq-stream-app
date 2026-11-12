@@ -2,7 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { isStepCount } from "ai";
 import type { ModelMessage } from "ai";
-import { MAX_TOOL_STEPS } from "../lib/chat-tool-config";
+import {
+  isRunTokenBudgetExceeded,
+  MAX_RUN_TOKENS,
+  MAX_TOOL_STEPS,
+} from "../lib/chat-tool-config";
 import {
   estimateInputTokens,
   isWithinInputTokenBudget,
@@ -102,10 +106,28 @@ test("input budget includes exactly-at-limit requests and rejects overflow", () 
   );
 });
 
-test("the shared stop condition allows at most five model/tool steps", async () => {
+test("the shared stop condition allows at most eight model/tool steps", async () => {
   const stopWhen = isStepCount(MAX_TOOL_STEPS);
   const steps = (length: number) => Array.from({ length }, () => ({})) as never[];
 
   assert.equal(await stopWhen({ steps: steps(MAX_TOOL_STEPS - 1) }), false);
   assert.equal(await stopWhen({ steps: steps(MAX_TOOL_STEPS) }), true);
+});
+
+test("the run token budget includes input and output tokens across steps", () => {
+  assert.equal(
+    isRunTokenBudgetExceeded({
+      steps: [
+        { usage: { inputTokens: MAX_RUN_TOKENS - 20, outputTokens: 10 } },
+        { usage: { inputTokens: 5, outputTokens: 5 } },
+      ],
+    }),
+    true,
+  );
+  assert.equal(
+    isRunTokenBudgetExceeded({
+      steps: [{ usage: { inputTokens: MAX_RUN_TOKENS - 1, outputTokens: 0 } }],
+    }),
+    false,
+  );
 });

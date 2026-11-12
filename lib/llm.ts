@@ -58,6 +58,7 @@ export function streamLlm({
   onChunk,
   onError,
   onFinish,
+  onStepEnd,
   ...options
 }: StreamLlmOptions) {
   const startedAt = Date.now();
@@ -115,6 +116,41 @@ export function streamLlm({
       }
 
       await onChunk?.({ chunk });
+    },
+    onStepEnd: async (step) => {
+      const interactions = step.toolCalls.map((toolCall) => {
+        const result = step.toolResults.find(
+          (toolResult) => toolResult.toolCallId === toolCall.toolCallId,
+        );
+        return {
+          tool: toolCall.toolName,
+          args: toolCall.input,
+          result: result?.output,
+          latencyMs: step.performance.toolExecutionMs[toolCall.toolCallId] ?? null,
+        };
+      });
+      logStructuredEvent("agent.step.completed", {
+        requestId,
+        chatId,
+        step: step.stepNumber + 1,
+        tools: includeRawContent
+          ? interactions
+          : interactions.map((interaction) => ({
+              tool: interaction.tool,
+              args: summarizeValue(interaction.args),
+              result:
+                interaction.result === undefined
+                  ? null
+                  : summarizeValue(interaction.result),
+              latencyMs: interaction.latencyMs,
+            })),
+        latencyMs: step.performance.stepTimeMs,
+        inputTokens: step.usage.inputTokens ?? null,
+        outputTokens: step.usage.outputTokens ?? null,
+        totalTokens:
+          (step.usage.inputTokens ?? 0) + (step.usage.outputTokens ?? 0),
+      });
+      await onStepEnd?.(step);
     },
     onFinish: async (result) => {
       logStructuredEvent("llm.response.completed", {

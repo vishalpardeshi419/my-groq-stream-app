@@ -14,6 +14,9 @@ type TokenAuditMetrics = {
   estimatedInputTokens: number | null;
   inputTokens: number | null;
   outputTokens: number | null;
+  totalRunTokens: number | null;
+  maxRunTokens: number;
+  tokenBudgetExceeded: boolean;
   partialOutputTokenEstimate?: number;
 };
 
@@ -77,6 +80,10 @@ export default function ChatComponent() {
             {auditMetrics.outputTokens == null ? " estimated" : " tokens"}
           </span>
           <span>Latency: {auditMetrics.latencyMs} ms</span>
+          <span>
+            Run tokens: {auditMetrics.totalRunTokens ?? "N/A"} / {auditMetrics.maxRunTokens}
+          </span>
+          {auditMetrics.tokenBudgetExceeded && <span>Token budget reached</span>}
           <span>Status: {auditMetrics.status}</span>
           <span>Requested: {new Date(auditMetrics.requestedAt).toLocaleString()}</span>
         </section>
