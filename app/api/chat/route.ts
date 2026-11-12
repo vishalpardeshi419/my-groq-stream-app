@@ -18,7 +18,12 @@ import {
   CHAT_TOOL_SCHEMAS,
   createChatTools,
 } from "@/lib/chat-tools";
-import { MAX_TOOL_STEPS } from "@/lib/chat-tool-config";
+import {
+  getRunTokenTotal,
+  isRunTokenBudgetExceeded,
+  MAX_RUN_TOKENS,
+  MAX_TOOL_STEPS,
+} from "@/lib/chat-tool-config";
 import {
   estimateInputTokens,
   isWithinInputTokenBudget,
@@ -57,7 +62,12 @@ function logRequestMetrics(data: {
   inputTokens?: number | null;
   outputTokens?: number | null;
   partialOutputTokenEstimate?: number;
+  tokenBudgetExceeded?: boolean;
 }) {
+  const totalRunTokens =
+    data.inputTokens == null && data.outputTokens == null
+      ? null
+      : (data.inputTokens ?? 0) + (data.outputTokens ?? 0);
   const metrics = {
     requestId: data.requestId,
     chatId: data.chatId,
@@ -71,6 +81,9 @@ function logRequestMetrics(data: {
     inputTokens: data.inputTokens ?? null,
     outputTokens: data.outputTokens ?? null,
     partialOutputTokenEstimate: data.partialOutputTokenEstimate,
+    totalRunTokens,
+    maxRunTokens: MAX_RUN_TOKENS,
+    tokenBudgetExceeded: data.tokenBudgetExceeded ?? false,
   };
   logStructuredEvent("llm.request.metrics", metrics);
   return metrics;
@@ -155,6 +168,7 @@ export async function POST(req: Request) {
     execute: ({ writer }) => {
       let partialResponse = "";
       let metricsLogged = false;
+      let tokenBudgetExceeded = false;
       const sendFinalMetrics = (
         status: "completed" | "aborted" | "failed",
         inputTokens?: number | null,
@@ -174,6 +188,7 @@ export async function POST(req: Request) {
           status,
           inputTokens,
           outputTokens,
+          tokenBudgetExceeded,
           partialOutputTokenEstimate: countTokens(partialResponse),
         });
         writer.write({
@@ -190,7 +205,23 @@ export async function POST(req: Request) {
         system: CHAT_SYSTEM_PROMPT,
         messages: modelMessages,
         tools: createChatTools(chatId),
-        stopWhen: isStepCount(MAX_TOOL_STEPS),
+        toolCallConcurrency: 5,
+        stopWhen: [
+          isStepCount(MAX_TOOL_STEPS),
+          ({ steps }) => {
+            tokenBudgetExceeded = isRunTokenBudgetExceeded({ steps });
+            if (tokenBudgetExceeded) {
+              logStructuredEvent("agent.run.token_budget_exceeded", {
+                requestId,
+                chatId,
+                totalRunTokens: getRunTokenTotal({ steps }),
+                maxRunTokens: MAX_RUN_TOKENS,
+                completedSteps: steps.length,
+              });
+            }
+            return tokenBudgetExceeded;
+          },
+        ],
 
         // Automatically forwards the user's AbortController signal.
         abortSignal: req.signal,
