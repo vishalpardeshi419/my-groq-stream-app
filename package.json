@@ -7,11 +7,13 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test": "tsx --test tests/token-preflight.test.ts tests/weather.test.ts"
+    "mcp:search-docs": "tsx mcp/search-docs.ts",
+    "test": "tsx --test tests/token-preflight.test.ts tests/weather.test.ts tests/mcp-search-docs.test.ts"
   },
   "dependencies": {
     "@ai-sdk/groq": "^4.0.63",
     "@ai-sdk/react": "^4.0.147",
+    "@modelcontextprotocol/sdk": "^1.32.2",
     "ai": "^7.0.143",
     "gpt-tokenizer": "^4.1.0",
     "lucide-react": "^1.59.0",

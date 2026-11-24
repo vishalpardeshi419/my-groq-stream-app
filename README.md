@@ -62,6 +62,14 @@ Prompt, message, tool input/output, and response contents are redacted by defaul
 
 The `/logs` page reads from a development-only in-memory buffer that retains the latest 500 events. Logs are cleared when the server restarts and are not available in production. The `get_recent_usage` tool reads token and latency metrics from this same buffer. Use a database or external log service if logs must persist across restarts or deployments.
 
+## MCP search_docs server
+
+This repository includes a standalone MCP server that exposes a read-only
+`search_docs` tool over stdio. Start it with `npm run mcp:search-docs`, or test
+tool discovery and invocation using the MCP Inspector CLI. See
+[`docs/mcp-overview.md`](docs/mcp-overview.md) for the protocol overview,
+Inspector commands, and client configuration.
+
 ## Validation
 
 ```bash
