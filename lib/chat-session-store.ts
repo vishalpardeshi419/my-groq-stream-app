@@ -14,6 +14,7 @@ export type ChatSession = {
   messages: UIMessage[];
   pendingToolCalls: PendingToolCall[];
   stepCount: number;
+  runTokenCount: number;
   status: "running" | "ready" | "awaiting_approval" | "failed";
 };
 
@@ -22,15 +23,21 @@ type ChatSessionRow = QueryResultRow & {
   messages: UIMessage[];
   pending_tool_calls: PendingToolCall[];
   step_count: number;
+  run_token_count: number;
   status: ChatSession["status"];
 };
 
 type SessionTransition = {
   messages: UIMessage[];
   stepCount: number;
+  runTokenCount: number;
 };
 
 type ToolInputValidator = (toolName: string, input: unknown) => unknown;
+type ChatToolPart = Extract<
+  UIMessage["parts"][number],
+  { type: `tool-${string}` }
+>;
 
 let pool: Pool | undefined;
 let schemaPromise: Promise<void> | undefined;
@@ -62,12 +69,18 @@ async function ensureSchema() {
           messages jsonb NOT NULL,
           pending_tool_calls jsonb NOT NULL DEFAULT '[]'::jsonb,
           step_count integer NOT NULL DEFAULT 0,
+          run_token_count integer NOT NULL DEFAULT 0,
           status text NOT NULL CHECK (
             status IN ('running', 'ready', 'awaiting_approval', 'failed')
           ),
           updated_at timestamptz NOT NULL DEFAULT now()
         )
       `)
+      .then(() =>
+        getPool().query(
+          "ALTER TABLE chat_agent_sessions ADD COLUMN IF NOT EXISTS run_token_count integer NOT NULL DEFAULT 0",
+        ),
+      )
       .then(() => undefined)
       .catch((error: unknown) => {
         schemaPromise = undefined;
@@ -86,11 +99,11 @@ function getPendingToolCalls(messages: UIMessage[]): PendingToolCall[] {
 
     for (const part of message.parts) {
       if (
-        part.type.startsWith("tool-") &&
-        "state" in part &&
+        isToolPart(part) &&
         part.state === "approval-requested" &&
         "input" in part &&
-        "approval" in part
+        "approval" in part &&
+        part.approval
       ) {
         pending.push({
           approvalId: part.approval.id,
@@ -105,22 +118,28 @@ function getPendingToolCalls(messages: UIMessage[]): PendingToolCall[] {
   return pending;
 }
 
+function isToolPart(part: UIMessage["parts"][number]): part is ChatToolPart {
+  return part.type.startsWith("tool-") && "toolCallId" in part;
+}
+
 function findToolPart(
   messages: UIMessage[],
   toolCallId: string,
-): { messageIndex: number; partIndex: number; part: UIMessage["parts"][number] } | undefined {
+): { messageIndex: number; partIndex: number; part: ChatToolPart } | undefined {
   for (let messageIndex = 0; messageIndex < messages.length; messageIndex += 1) {
     const message = messages[messageIndex];
     if (message.role !== "assistant") continue;
 
     const partIndex = message.parts.findIndex(
-      (part) => part.type.startsWith("tool-") && part.toolCallId === toolCallId,
+      (part) => isToolPart(part) && part.toolCallId === toolCallId,
     );
     if (partIndex !== -1) {
+      const part = message.parts[partIndex];
+      if (!isToolPart(part)) continue;
       return {
         messageIndex,
         partIndex,
-        part: message.parts[partIndex],
+        part,
       };
     }
   }
@@ -137,13 +156,16 @@ function expectNewUserMessage(messages: UIMessage[]) {
 }
 
 export function prepareSessionTransition(
-  session: Pick<ChatSession, "messages" | "pendingToolCalls" | "stepCount" | "status"> | null,
+  session: Pick<
+    ChatSession,
+    "messages" | "pendingToolCalls" | "stepCount" | "runTokenCount" | "status"
+  > | null,
   incomingMessages: UIMessage[],
   validateToolInput: ToolInputValidator,
 ): SessionTransition {
   if (!session) {
     expectNewUserMessage(incomingMessages);
-    return { messages: incomingMessages, stepCount: 0 };
+    return { messages: incomingMessages, stepCount: 0, runTokenCount: 0 };
   }
 
   if (session.status === "ready") {
@@ -158,7 +180,7 @@ export function prepareSessionTransition(
       throw new Error("The submitted chat history does not match the saved session.");
     }
 
-    return { messages: incomingMessages, stepCount: 0 };
+    return { messages: incomingMessages, stepCount: 0, runTokenCount: 0 };
   }
 
   if (
@@ -175,17 +197,25 @@ export function prepareSessionTransition(
   for (const pendingToolCall of session.pendingToolCalls) {
     const storedPart = findToolPart(expectedMessages, pendingToolCall.toolCallId);
     const incomingPart = findToolPart(incomingMessages, pendingToolCall.toolCallId);
+    const storedApproval =
+      storedPart && "approval" in storedPart.part
+        ? storedPart.part.approval
+        : undefined;
+    const incomingApproval =
+      incomingPart && "approval" in incomingPart.part
+        ? incomingPart.part.approval
+        : undefined;
 
     if (
       !storedPart ||
       !incomingPart ||
       storedPart.part.state !== "approval-requested" ||
-      !("approval" in storedPart.part) ||
-      storedPart.part.approval.id !== pendingToolCall.approvalId ||
+      !storedApproval ||
+      storedApproval.id !== pendingToolCall.approvalId ||
       incomingPart.part.state !== "approval-responded" ||
-      !("approval" in incomingPart.part) ||
-      incomingPart.part.approval.id !== pendingToolCall.approvalId ||
-      typeof incomingPart.part.approval.approved !== "boolean"
+      !incomingApproval ||
+      incomingApproval.id !== pendingToolCall.approvalId ||
+      typeof incomingApproval.approved !== "boolean"
     ) {
       throw new Error("The tool approval response does not match the pending action.");
     }
@@ -199,10 +229,10 @@ export function prepareSessionTransition(
       input: validatedInput,
       state: "approval-responded" as const,
       approval: {
-        ...storedPart.part.approval,
-        approved: incomingPart.part.approval.approved,
-        ...(incomingPart.part.approval.reason
-          ? { reason: incomingPart.part.approval.reason }
+        ...storedApproval,
+        approved: incomingApproval.approved,
+        ...(incomingApproval.reason
+          ? { reason: incomingApproval.reason }
           : {}),
       },
     };
@@ -224,7 +254,11 @@ export function prepareSessionTransition(
     throw new Error("The chat history contains changes beyond the approval decision.");
   }
 
-  return { messages: expectedMessages, stepCount: session.stepCount };
+  return {
+    messages: expectedMessages,
+    stepCount: session.stepCount,
+    runTokenCount: session.runTokenCount,
+  };
 }
 
 function toChatSession(row: ChatSessionRow): ChatSession {
@@ -233,6 +267,7 @@ function toChatSession(row: ChatSessionRow): ChatSession {
     messages: row.messages,
     pendingToolCalls: row.pending_tool_calls,
     stepCount: row.step_count,
+    runTokenCount: row.run_token_count,
     status: row.status,
   };
 }
@@ -240,7 +275,7 @@ function toChatSession(row: ChatSessionRow): ChatSession {
 export async function getChatSession(chatId: string) {
   await ensureSchema();
   const result = await getPool().query<ChatSessionRow>(
-    `SELECT chat_id, messages, pending_tool_calls, step_count, status
+    `SELECT chat_id, messages, pending_tool_calls, step_count, run_token_count, status
      FROM chat_agent_sessions
      WHERE chat_id = $1`,
     [chatId],
@@ -260,7 +295,7 @@ export async function beginChatRun(
   try {
     await client.query("BEGIN");
     const result = await client.query<ChatSessionRow>(
-      `SELECT chat_id, messages, pending_tool_calls, step_count, status
+      `SELECT chat_id, messages, pending_tool_calls, step_count, run_token_count, status
        FROM chat_agent_sessions
        WHERE chat_id = $1
        FOR UPDATE`,
@@ -277,16 +312,27 @@ export async function beginChatRun(
       await client.query(
         `UPDATE chat_agent_sessions
          SET messages = $2, pending_tool_calls = '[]'::jsonb,
-             step_count = $3, status = 'running', updated_at = now()
+             step_count = $3, run_token_count = $4,
+             status = 'running', updated_at = now()
          WHERE chat_id = $1`,
-        [chatId, JSON.stringify(transition.messages), transition.stepCount],
+        [
+          chatId,
+          JSON.stringify(transition.messages),
+          transition.stepCount,
+          transition.runTokenCount,
+        ],
       );
     } else {
       await client.query(
         `INSERT INTO chat_agent_sessions
-          (chat_id, messages, pending_tool_calls, step_count, status)
-         VALUES ($1, $2, '[]'::jsonb, $3, 'running')`,
-        [chatId, JSON.stringify(transition.messages), transition.stepCount],
+          (chat_id, messages, pending_tool_calls, step_count, run_token_count, status)
+         VALUES ($1, $2, '[]'::jsonb, $3, $4, 'running')`,
+        [
+          chatId,
+          JSON.stringify(transition.messages),
+          transition.stepCount,
+          transition.runTokenCount,
+        ],
       );
     }
 
@@ -304,10 +350,12 @@ export async function finishChatRun({
   chatId,
   messages,
   stepCount,
+  runTokenCount,
 }: {
   chatId: string;
   messages: UIMessage[];
   stepCount: number;
+  runTokenCount: number;
 }) {
   await ensureSchema();
   const pendingToolCalls = getPendingToolCalls(messages);
@@ -315,13 +363,14 @@ export async function finishChatRun({
   const result = await getPool().query(
     `UPDATE chat_agent_sessions
      SET messages = $2, pending_tool_calls = $3, step_count = $4,
-         status = $5, updated_at = now()
+         run_token_count = $5, status = $6, updated_at = now()
      WHERE chat_id = $1 AND status = 'running'`,
     [
       chatId,
       JSON.stringify(messages),
       JSON.stringify(pendingToolCalls),
       stepCount,
+      runTokenCount,
       status,
     ],
   );

@@ -11,7 +11,10 @@ import {
   searchRefundPolicy,
   simulateRefund,
 } from "@/lib/agent-tools";
-import { createAgentToolExecutor } from "@/lib/agent-tool-executor";
+import {
+  createAgentToolExecutor,
+  getToolFaultInjectorFromEnv,
+} from "@/lib/agent-tool-executor";
 
 export const CHAT_TOOL_INSTRUCTIONS = [
   "For a request that needs tools, start with a short, user-facing plan of up to three steps; before each later tool call, briefly state the next action and adapt it to the results so far.",
@@ -50,6 +53,10 @@ const refundInputSchema = z.object({
   orderId: z.string().trim().min(1).max(32).describe("Order identifier"),
   amount: z.number().positive().max(1_000_000).describe("Refund amount in INR"),
 });
+const toolCallErrorInputSchema = z.object({
+  message: z.string().trim().min(1).max(1_200),
+  exhausted: z.boolean().default(false),
+});
 
 export const CHAT_TOOL_INPUT_SCHEMAS = {
   get_time: timeInputSchema,
@@ -60,6 +67,7 @@ export const CHAT_TOOL_INPUT_SCHEMAS = {
   search_refund_policy: refundPolicyInputSchema,
   get_order_details: orderInputSchema,
   refund_order: refundInputSchema,
+  report_tool_error: toolCallErrorInputSchema,
 };
 
 export const CHAT_TOOL_SCHEMAS = [
@@ -105,34 +113,66 @@ export const CHAT_TOOL_SCHEMAS = [
       "Simulate a refund for an eligible demo order. This action always requires human approval and never issues a real payment.",
     inputSchema: z.toJSONSchema(refundInputSchema),
   },
+  {
+    name: "report_tool_error",
+    description:
+      "Internal recovery tool used to return a validation correction to the model. Never use it for user requests.",
+    inputSchema: z.toJSONSchema(toolCallErrorInputSchema),
+  },
 ];
 
-export function createChatTools(chatId: string) {
+export function createChatTools(chatId: string, requestId?: string) {
   const executeTool = createAgentToolExecutor((toolName, error) => {
     logStructuredEvent("llm.tool.execution_failed", {
       chatId,
+      requestId,
       toolName,
       errorType: error instanceof Error ? error.name : typeof error,
     });
+  }, {
+    injectFault: getToolFaultInjectorFromEnv(),
+    onEvent(event) {
+      logStructuredEvent(`agent.tool.${event.type}`, {
+        chatId,
+        requestId,
+        ...event,
+      });
+    },
   });
 
   return {
     get_time: tool({
       description: "Get the current system timestamp in ISO 8601 format.",
       inputSchema: timeInputSchema,
-      execute: async () => executeTool("get_time", {}, getCurrentTime),
+      execute: async (_input, { abortSignal }) =>
+        executeTool(
+          "get_time",
+          {},
+          () => getCurrentTime(),
+          { signal: abortSignal },
+        ),
     }),
     calculator: tool({
       description: "Evaluate a basic arithmetic expression.",
       inputSchema: calculatorInputSchema,
-      execute: async ({ expression }) =>
-        executeTool("calculator", { expression }, () => calculate(expression)),
+      execute: async ({ expression }, { abortSignal }) =>
+        executeTool(
+          "calculator",
+          { expression },
+          () => calculate(expression),
+          { signal: abortSignal },
+        ),
     }),
     search_notes: tool({
       description: "Search the local hardcoded notes dictionary.",
       inputSchema: searchNotesInputSchema,
-      execute: async ({ query }) =>
-        executeTool("search_notes", { query }, () => searchNotes(query)),
+      execute: async ({ query }, { abortSignal }) =>
+        executeTool(
+          "search_notes",
+          { query },
+          () => searchNotes(query),
+          { signal: abortSignal },
+        ),
     }),
     get_weather: tool({
       description: "Get current weather for a city using OpenWeather.",
@@ -141,11 +181,11 @@ export function createChatTools(chatId: string) {
         const result = await executeTool(
           "get_weather",
           { location, units },
-          async () => {
+          async ({ signal }) => {
             const weather = await fetchCurrentWeather({
               location,
               units,
-              signal: abortSignal,
+              signal,
             });
             logStructuredEvent(
               weather.ok ? "tool.weather.completed" : "tool.weather.failed",
@@ -158,6 +198,7 @@ export function createChatTools(chatId: string) {
             );
             return weather;
           },
+          { signal: abortSignal },
         );
         return result;
       },
@@ -166,7 +207,7 @@ export function createChatTools(chatId: string) {
       description:
         "Summarize recent token usage and response latency for this chat from the app's local runtime logs.",
       inputSchema: usageInputSchema,
-      execute: async ({ limit }) =>
+      execute: async ({ limit }, { abortSignal }) =>
         executeTool("get_recent_usage", { limit }, async () => {
           if (process.env.NODE_ENV !== "development") {
             return {
@@ -202,22 +243,28 @@ export function createChatTools(chatId: string) {
             requests,
             storage: "development in-memory runtime logs",
           };
-        }),
+        }, { signal: abortSignal }),
     }),
     search_refund_policy: tool({
       description: "Search the demo refund policy before making a refund decision.",
       inputSchema: refundPolicyInputSchema,
-      execute: async ({ query }) =>
-        executeTool("search_refund_policy", { query }, () =>
-          searchRefundPolicy(query),
+      execute: async ({ query }, { abortSignal }) =>
+        executeTool(
+          "search_refund_policy",
+          { query },
+          () => searchRefundPolicy(query),
+          { signal: abortSignal },
         ),
     }),
     get_order_details: tool({
       description: "Fetch details for a demo order.",
       inputSchema: orderInputSchema,
-      execute: async ({ orderId }) =>
-        executeTool("get_order_details", { orderId }, () =>
-          getOrderDetails(orderId),
+      execute: async ({ orderId }, { abortSignal }) =>
+        executeTool(
+          "get_order_details",
+          { orderId },
+          () => getOrderDetails(orderId),
+          { signal: abortSignal },
         ),
     }),
     refund_order: tool({
@@ -225,9 +272,31 @@ export function createChatTools(chatId: string) {
         "Simulate a refund for an eligible demo order. This action always requires human approval and never issues a real payment.",
       inputSchema: refundInputSchema,
       needsApproval: true,
-      execute: async ({ orderId, amount }) =>
-        executeTool("refund_order", { orderId, amount }, () =>
-          simulateRefund(orderId, amount),
+      execute: async ({ orderId, amount }, { abortSignal }) =>
+        executeTool(
+          "refund_order",
+          { orderId, amount },
+          () => simulateRefund(orderId, amount),
+          { signal: abortSignal, maxRetries: 0 },
+        ),
+    }),
+    report_tool_error: tool({
+      description:
+        "Return a bounded tool-call correction to the model. This tool performs no external action.",
+      inputSchema: toolCallErrorInputSchema,
+      execute: async ({ message, exhausted }, { abortSignal }) =>
+        executeTool(
+          "report_tool_error",
+          { message, exhausted },
+          () => ({
+            ok: false as const,
+            error: exhausted
+              ? `${message} The correction limit was reached; explain the issue to the user and stop.`
+              : message,
+            code: "invalid-tool-call",
+            retryable: false,
+          }),
+          { signal: abortSignal, maxRetries: 0 },
         ),
     }),
   };

@@ -7,10 +7,11 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test": "tsx --test tests/agent-tools.test.ts tests/agent-tool-executor.test.ts tests/token-preflight.test.ts tests/weather.test.ts"
+    "test": "tsx --test tests/agent-tools.test.ts tests/agent-tool-executor.test.ts tests/agent-chaos.test.ts tests/llm-resilience.test.ts tests/token-preflight.test.ts tests/weather.test.ts"
   },
   "dependencies": {
     "@ai-sdk/groq": "^4.0.63",
+    "@ai-sdk/openai": "4.0.96",
     "@ai-sdk/react": "^4.0.147",
     "@types/pg": "^8.23.1",
     "ai": "^7.0.143",

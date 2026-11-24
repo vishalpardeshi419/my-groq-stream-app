@@ -33,6 +33,7 @@ export type WeatherResult =
         | "cancelled"
         | "unavailable";
       error: string;
+      retryable: boolean;
     };
 
 export async function fetchCurrentWeather({
@@ -56,6 +57,7 @@ export async function fetchCurrentWeather({
       ok: false,
       code: "not-configured",
       error: "Weather lookup is not configured. Add OPENWEATHER_API_KEY on the server.",
+      retryable: false,
     };
   }
 
@@ -81,6 +83,7 @@ export async function fetchCurrentWeather({
           ok: false,
           code: "location-not-found",
           error: "Location not found. Provide a city name and optionally a country code.",
+          retryable: false,
         };
       }
       if (response.status === 401) {
@@ -88,12 +91,14 @@ export async function fetchCurrentWeather({
           ok: false,
           code: "invalid-api-key",
           error: "The weather service rejected its server credentials.",
+          retryable: false,
         };
       }
       return {
         ok: false,
         code: "http-error",
         error: `The weather service returned status ${response.status}.`,
+        retryable: response.status === 429 || response.status >= 500,
       };
     }
 
@@ -103,6 +108,7 @@ export async function fetchCurrentWeather({
         ok: false,
         code: "invalid-response",
         error: "The weather service returned an unexpected response.",
+        retryable: false,
       };
     }
 
@@ -123,6 +129,7 @@ export async function fetchCurrentWeather({
         ok: false,
         code: "cancelled",
         error: "The weather lookup was cancelled.",
+        retryable: false,
       };
     }
 
@@ -131,6 +138,7 @@ export async function fetchCurrentWeather({
         ok: false,
         code: "timeout",
         error: "The weather lookup timed out. Try again later.",
+        retryable: true,
       };
     }
 
@@ -138,6 +146,7 @@ export async function fetchCurrentWeather({
       ok: false,
       code: "unavailable",
       error: "The weather service could not be reached. Try again later.",
+      retryable: true,
     };
   }
 }

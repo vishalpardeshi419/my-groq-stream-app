@@ -4,7 +4,8 @@ import {
   convertToModelMessages,
   createUIMessageStream,
   createUIMessageStreamResponse,
-  isStepCount,
+  InvalidToolInputError,
+  NoSuchToolError,
   toUIMessageStream,
   type UIMessage,
 } from "ai";
@@ -31,9 +32,12 @@ import {
   getRunTokenTotal,
   isRunTokenBudgetExceeded,
   MAX_RUN_TOKENS,
+  MAX_RUN_WALL_CLOCK_MS,
+  MAX_TOOL_REPAIR_ATTEMPTS,
   MAX_TOOL_STEPS,
 } from "@/lib/chat-tool-config";
 import {
+  compactToolResultHistory,
   estimateInputTokens,
   isWithinInputTokenBudget,
   TOKEN_PREFLIGHT_SAFETY_MARGIN,
@@ -43,6 +47,7 @@ import { SYSTEM_PROMPTS } from "@/lib/prompts";
 export const maxDuration = 30; // Max execution time for serverless deployment
 
 const MAX_CONTEXT_TOKENS = 131_072;
+const MAX_CORRECTION_MESSAGE_CHARACTERS = 1_000;
 const chatRequestSchema = z.object({
   chatId: z.string().uuid(),
   messages: z.array(z.unknown()).min(1).max(100),
@@ -76,6 +81,7 @@ function logRequestMetrics(data: {
   outputTokens?: number | null;
   partialOutputTokenEstimate?: number;
   tokenBudgetExceeded?: boolean;
+  cumulativeRunTokens?: number;
 }) {
   const totalRunTokens =
     data.inputTokens == null && data.outputTokens == null
@@ -97,6 +103,7 @@ function logRequestMetrics(data: {
     totalRunTokens,
     maxRunTokens: MAX_RUN_TOKENS,
     tokenBudgetExceeded: data.tokenBudgetExceeded ?? false,
+    cumulativeRunTokens: data.cumulativeRunTokens ?? null,
   };
   logStructuredEvent("llm.request.metrics", metrics);
   return metrics;
@@ -166,7 +173,6 @@ export async function POST(req: Request) {
   }
 
   const { chatId } = parsedBody.data;
-  const tools = createChatTools(chatId);
   let messages: UIMessage[];
   try {
     messages = await validateUIMessages<UIMessage>({
@@ -204,8 +210,16 @@ export async function POST(req: Request) {
   const startedAt = Date.now();
   const requestedAt = new Date(startedAt).toISOString();
   const modelMessages = await convertToModelMessages(messages);
+  const compactedHistory = compactToolResultHistory(modelMessages);
+  if (compactedHistory.compactedCount > 0) {
+    logStructuredEvent("agent.context.tool_results_compacted", {
+      requestId,
+      chatId,
+      compactedCount: compactedHistory.compactedCount,
+    });
+  }
   const estimate = estimateInputTokens({
-    messages: modelMessages,
+    messages: compactedHistory.messages,
     systemPrompt: CHAT_SYSTEM_PROMPT,
     toolSchemas: CHAT_TOOL_SCHEMAS,
   });
@@ -275,14 +289,56 @@ export async function POST(req: Request) {
   }
 
   const trustedMessages = runState.messages;
-  const trustedModelMessages = await convertToModelMessages(trustedMessages);
+  const convertedTrustedMessages = await convertToModelMessages(trustedMessages);
+  const trustedModelMessages =
+    compactToolResultHistory(convertedTrustedMessages).messages;
+  const tools = createChatTools(chatId, requestId);
   let completedSteps = runState.stepCount;
 
   const stream = createUIMessageStream({
+    onError: () =>
+      "The assistant encountered an unexpected error. Any verified partial results remain above; please try again.",
     execute: ({ writer }) => {
       let partialResponse = "";
       let metricsLogged = false;
       let tokenBudgetExceeded = false;
+      let stepLimitExceeded = false;
+      let wallClockExceeded = false;
+      let toolRepairAttempts = 0;
+      let runStopReason: "token-budget" | "step-limit" | "tool-correction-limit" | null =
+        null;
+      const remainingSteps = Math.max(
+        1,
+        MAX_TOOL_STEPS - runState.stepCount,
+      );
+      const wallClockController = new AbortController();
+      const remainingWallClockMs = Math.max(
+        0,
+        MAX_RUN_WALL_CLOCK_MS - (Date.now() - startedAt),
+      );
+      const wallClockTimer = setTimeout(() => {
+        wallClockExceeded = true;
+        wallClockController.abort(
+          new Error("The agent run exceeded its wall-clock limit."),
+        );
+      }, remainingWallClockMs);
+      const runAbortSignal = AbortSignal.any([
+        req.signal,
+        wallClockController.signal,
+      ]);
+      const clearWallClockTimer = () => clearTimeout(wallClockTimer);
+      let completedRunTokens = runState.runTokenCount;
+      let runNotice = "";
+      let runNoticeMessageId: string | undefined;
+      const appendRunNotice = (notice: string) => {
+        const id = randomUUID();
+        runNotice = notice;
+        runNoticeMessageId = id;
+        writer.write({ type: "text-start", id });
+        writer.write({ type: "text-delta", id, delta: notice });
+        writer.write({ type: "text-end", id });
+        partialResponse += notice;
+      };
       const sendFinalMetrics = (
         status: "completed" | "aborted" | "failed",
         inputTokens?: number | null,
@@ -303,6 +359,7 @@ export async function POST(req: Request) {
           inputTokens,
           outputTokens,
           tokenBudgetExceeded,
+          cumulativeRunTokens: completedRunTokens,
           partialOutputTokenEstimate: countTokens(partialResponse),
         });
         writer.write({
@@ -321,24 +378,95 @@ export async function POST(req: Request) {
         tools,
         toolCallConcurrency: 5,
         stopWhen: [
-          isStepCount(Math.max(1, MAX_TOOL_STEPS - runState.stepCount)),
           ({ steps }) => {
-            tokenBudgetExceeded = isRunTokenBudgetExceeded({ steps });
+            tokenBudgetExceeded = isRunTokenBudgetExceeded({
+              steps,
+              previousTokens: runState.runTokenCount,
+            });
             if (tokenBudgetExceeded) {
+              runStopReason = "token-budget";
               logStructuredEvent("agent.run.token_budget_exceeded", {
                 requestId,
                 chatId,
-                totalRunTokens: getRunTokenTotal({ steps }),
+                totalRunTokens: getRunTokenTotal({
+                  steps,
+                  previousTokens: runState.runTokenCount,
+                }),
                 maxRunTokens: MAX_RUN_TOKENS,
                 completedSteps: steps.length,
               });
             }
-            return tokenBudgetExceeded;
+            stepLimitExceeded =
+              steps.length >= remainingSteps &&
+              (steps.at(-1)?.toolCalls.length ?? 0) > 0;
+            if (stepLimitExceeded && runStopReason === null) {
+              runStopReason = "step-limit";
+              logStructuredEvent("agent.run.step_limit_exceeded", {
+                requestId,
+                chatId,
+                completedSteps: steps.length,
+                maxToolSteps: MAX_TOOL_STEPS,
+              });
+            }
+            if (
+              toolRepairAttempts >= MAX_TOOL_REPAIR_ATTEMPTS &&
+              runStopReason === null
+            ) {
+              runStopReason = "tool-correction-limit";
+              logStructuredEvent("agent.tool_call.correction_limit_reached", {
+                requestId,
+                chatId,
+                attempts: toolRepairAttempts,
+              });
+            }
+            return (
+              tokenBudgetExceeded ||
+              stepLimitExceeded ||
+              toolRepairAttempts >= MAX_TOOL_REPAIR_ATTEMPTS
+            );
           },
         ],
+        abortSignal: runAbortSignal,
 
-        // Automatically forwards the user's AbortController signal.
-        abortSignal: req.signal,
+        repairToolCall: async ({ toolCall, error, tools: availableTools }) => {
+          toolRepairAttempts += 1;
+          if (toolRepairAttempts > MAX_TOOL_REPAIR_ATTEMPTS) {
+            logStructuredEvent("agent.tool_call.repair_exhausted", {
+              requestId,
+              chatId,
+              toolName: toolCall.toolName,
+              attempts: toolRepairAttempts,
+            });
+            return null;
+          }
+
+          const knownTools = Object.keys(availableTools).filter(
+            (toolName) => toolName !== "report_tool_error",
+          );
+          const correction = NoSuchToolError.isInstance(error)
+            ? `Tool "${error.toolName}" does not exist. Available tools: ${knownTools.join(", ")}.`
+            : InvalidToolInputError.isInstance(error)
+              ? `Invalid arguments for tool "${error.toolName}". Check its input schema and retry. ${error.message}`
+              : "The tool call was invalid. Check the available tool names and input schemas.";
+          const message = correction.slice(0, MAX_CORRECTION_MESSAGE_CHARACTERS);
+          const exhausted =
+            toolRepairAttempts >= MAX_TOOL_REPAIR_ATTEMPTS;
+          logStructuredEvent("agent.tool_call.repaired", {
+            requestId,
+            chatId,
+            toolName: toolCall.toolName,
+            errorType: NoSuchToolError.isInstance(error)
+              ? "unknown-tool"
+              : "invalid-input",
+            attempt: toolRepairAttempts,
+            exhausted,
+          });
+          return {
+            ...toolCall,
+            toolName: "report_tool_error",
+            input: JSON.stringify({ message, exhausted }),
+          };
+        },
 
         onChunk({ chunk }) {
           if (chunk.type === "text-delta") {
@@ -346,21 +474,46 @@ export async function POST(req: Request) {
           }
         },
 
-        onStepEnd() {
+        onStepEnd(step) {
           completedSteps += 1;
+          completedRunTokens +=
+            (step.usage.inputTokens ?? 0) + (step.usage.outputTokens ?? 0);
         },
 
-        async onFinish({ text, usage }) {
-          sendFinalMetrics("completed", usage.inputTokens, usage.outputTokens);
+        async onFinish({ text, usage, steps }) {
+          clearWallClockTimer();
+          completedRunTokens = getRunTokenTotal({
+            steps,
+            previousTokens: runState.runTokenCount,
+          });
+          runNotice =
+            runStopReason === "token-budget"
+              ? "\n\nThis run stopped at its token budget. I can continue if you want to proceed."
+              : runStopReason === "step-limit"
+                ? "\n\nThis run reached its step limit. I can continue if you want to proceed."
+                : runStopReason === "tool-correction-limit"
+                  ? "\n\nI could not produce a valid tool call after two corrections. Please rephrase the request."
+                  : "";
+          if (runNotice) appendRunNotice(runNotice);
+          sendFinalMetrics(
+            runStopReason ? "failed" : "completed",
+            usage.inputTokens,
+            usage.outputTokens,
+          );
           await saveMessageToDatabase({
             chatId,
             role: "assistant",
-            content: text,
-            status: "completed",
+            content: `${text}${runNotice}`,
+            status: runStopReason ? "failed" : "completed",
           });
         },
 
         async onAbort({ steps }) {
+          clearWallClockTimer();
+          completedRunTokens = getRunTokenTotal({
+            steps,
+            previousTokens: runState.runTokenCount,
+          });
           const completedUsage = steps.reduce(
             (total, step) => ({
               inputTokens: total.inputTokens + (step.usage.inputTokens ?? 0),
@@ -369,12 +522,29 @@ export async function POST(req: Request) {
             { inputTokens: 0, outputTokens: 0 },
           );
           sendFinalMetrics(
-            "aborted",
+            wallClockExceeded ? "failed" : "aborted",
             steps.length ? completedUsage.inputTokens : null,
             steps.length ? completedUsage.outputTokens : null,
           );
 
-          if (partialResponse.trim()) {
+          if (wallClockExceeded) {
+            const timeoutNotice = `\n\nThis run reached its ${Math.ceil(
+              MAX_RUN_WALL_CLOCK_MS / 1_000,
+            )}-second time limit. The text above is partial; tell me whether you want me to continue.`;
+            logStructuredEvent("agent.run.wall_clock_exceeded", {
+              requestId,
+              chatId,
+              maxRunWallClockMs: MAX_RUN_WALL_CLOCK_MS,
+              partialCharacters: partialResponse.length,
+            });
+            appendRunNotice(timeoutNotice);
+            await saveMessageToDatabase({
+              chatId,
+              role: "assistant",
+              content: partialResponse,
+              status: "failed",
+            });
+          } else if (partialResponse.trim()) {
             await saveMessageToDatabase({
               chatId,
               role: "assistant",
@@ -385,6 +555,7 @@ export async function POST(req: Request) {
         },
 
         onError({ error }) {
+          clearWallClockTimer();
           sendFinalMetrics("failed");
           logStructuredEvent("chat.generation.error", {
             requestId,
@@ -401,12 +572,29 @@ export async function POST(req: Request) {
           stream: result.stream,
           tools,
           originalMessages: trustedMessages,
+          onError: () =>
+            "The assistant encountered an unexpected error. Any verified partial results remain above; please try again.",
           async onEnd({ messages: completedMessages }) {
             try {
+              const checkpointMessages =
+                runNoticeMessageId &&
+                !completedMessages.some(
+                  (message) => message.id === runNoticeMessageId,
+                )
+                  ? [
+                      ...completedMessages,
+                      {
+                        id: runNoticeMessageId,
+                        role: "assistant" as const,
+                        parts: [{ type: "text" as const, text: runNotice }],
+                      },
+                    ]
+                  : completedMessages;
               await finishChatRun({
                 chatId,
-                messages: completedMessages,
+                messages: checkpointMessages,
                 stepCount: completedSteps,
+                runTokenCount: completedRunTokens,
               });
             } catch (error) {
               logStructuredEvent("chat.session.persistence.error", {

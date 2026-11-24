@@ -21,16 +21,23 @@ type TokenAuditMetrics = {
   totalRunTokens: number | null;
   maxRunTokens: number;
   tokenBudgetExceeded: boolean;
+  cumulativeRunTokens?: number | null;
   partialOutputTokenEstimate?: number;
 };
 
 type ChatData = { "token-audit": TokenAuditMetrics };
 type ChatMessage = UIMessage<unknown, ChatData>;
+type ChatToolPart = Extract<
+  ChatMessage["parts"][number],
+  { type: `tool-${string}` }
+>;
 
 const defaultDeclineReason =
   "Policy requires manager sign-off for amounts over ₹1,000.";
 
-function isToolPart(part: ChatMessage["parts"][number]) {
+function isToolPart(
+  part: ChatMessage["parts"][number],
+): part is ChatToolPart {
   return part.type.startsWith("tool-") && "toolCallId" in part;
 }
 

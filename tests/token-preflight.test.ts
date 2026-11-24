@@ -2,12 +2,14 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { isStepCount } from "ai";
 import type { ModelMessage } from "ai";
+import { countTokens } from "gpt-tokenizer/model/gpt-oss-120b";
 import {
   isRunTokenBudgetExceeded,
   MAX_RUN_TOKENS,
   MAX_TOOL_STEPS,
 } from "../lib/chat-tool-config";
 import {
+  compactToolResultHistory,
   estimateInputTokens,
   isWithinInputTokenBudget,
   TOKEN_PREFLIGHT_SAFETY_MARGIN,
@@ -72,6 +74,79 @@ test("preflight counts assistant reasoning and tool call/result history", () => 
   assert.ok(estimate.messageTokens > 0);
 });
 
+test("old tool results are compacted while the most recent messages are preserved", () => {
+  const messages: ModelMessage[] = [
+    { role: "user", content: "First request." },
+    { role: "assistant", content: "Looking it up." },
+    {
+      role: "tool",
+      content: [
+        {
+          type: "tool-result",
+          toolCallId: "old-call",
+          toolName: "search_notes",
+          output: {
+            type: "json",
+            value: { content: "large note ".repeat(1_000) },
+          },
+        },
+      ],
+    },
+    { role: "assistant", content: "Older answer." },
+    { role: "user", content: "Second request." },
+    { role: "assistant", content: "Checking again." },
+    {
+      role: "tool",
+      content: [
+        {
+          type: "tool-result",
+          toolCallId: "recent-call",
+          toolName: "search_notes",
+          output: { type: "json", value: { content: "recent note" } },
+        },
+      ],
+    },
+    { role: "assistant", content: "Recent answer." },
+  ];
+
+  const result = compactToolResultHistory(messages, 64);
+  const olderOutput = result.messages[2];
+  const recentOutput = result.messages[6];
+
+  assert.equal(result.compactedCount, 1);
+  assert.deepEqual(messages[2], {
+    role: "tool",
+    content: [
+      {
+        type: "tool-result",
+        toolCallId: "old-call",
+        toolName: "search_notes",
+        output: {
+          type: "json",
+          value: { content: "large note ".repeat(1_000) },
+        },
+      },
+    ],
+  });
+  assert.ok(olderOutput.role === "tool");
+  assert.ok(olderOutput.content[0].type === "tool-result");
+  assert.ok(
+    "value" in olderOutput.content[0].output &&
+      typeof olderOutput.content[0].output.value === "object" &&
+      olderOutput.content[0].output.value !== null &&
+      "toolOutputTruncated" in olderOutput.content[0].output.value,
+  );
+  if (
+    olderOutput.content[0].type === "tool-result" &&
+    "value" in olderOutput.content[0].output &&
+    typeof olderOutput.content[0].output.value === "object" &&
+    olderOutput.content[0].output.value !== null
+  ) {
+    assert.ok(countTokens(JSON.stringify(olderOutput.content[0].output.value)) <= 64);
+  }
+  assert.deepEqual(recentOutput, messages[6]);
+});
+
 test("preflight rejects unsupported image content instead of undercounting", () => {
   const messages: ModelMessage[] = [
     {
@@ -129,5 +204,12 @@ test("the run token budget includes input and output tokens across steps", () =>
       steps: [{ usage: { inputTokens: MAX_RUN_TOKENS - 1, outputTokens: 0 } }],
     }),
     false,
+  );
+  assert.equal(
+    isRunTokenBudgetExceeded({
+      steps: [{ usage: { inputTokens: 100, outputTokens: 100 } }],
+      previousTokens: MAX_RUN_TOKENS - 150,
+    }),
+    true,
   );
 });

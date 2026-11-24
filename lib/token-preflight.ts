@@ -6,6 +6,7 @@ import {
 import type { ChatMessage } from "gpt-tokenizer/functionCalling";
 
 export const TOKEN_PREFLIGHT_SAFETY_MARGIN = 1_024;
+export const MAX_TOOL_RESULT_HISTORY_TOKENS = 1_024;
 
 export type TokenPreflightEstimate = {
   estimatedInputTokens: number;
@@ -28,6 +29,73 @@ function getMessageText(message: ModelMessage): string | null {
     }
   }
   return text;
+}
+
+export function compactToolResultHistory(
+  messages: ModelMessage[],
+  maxResultTokens = MAX_TOOL_RESULT_HISTORY_TOKENS,
+) {
+  let compactedCount = 0;
+  const preserveRecentMessagesFrom = Math.max(0, messages.length - 4);
+  const compactedMessages = messages.map((message, index) => {
+    if (message.role !== "tool" || index >= preserveRecentMessagesFrom) {
+      return message;
+    }
+
+    return {
+      ...message,
+      content: message.content.map((part) => {
+        if (part.type !== "tool-result" || !("output" in part)) return part;
+        const output = part.output;
+        if (
+          !output ||
+          typeof output !== "object" ||
+          !("type" in output) ||
+          output.type !== "json" ||
+          !("value" in output)
+        ) {
+          return part;
+        }
+
+        const serialized = JSON.stringify(output.value);
+        if (countTokens(serialized) <= maxResultTokens) return part;
+
+        compactedCount += 1;
+        const createCompactValue = (preview: string) => ({
+          toolOutputTruncated: true,
+          originalCharacters: serialized.length,
+          preview,
+          message:
+            "An older tool result was shortened to protect the conversation context.",
+        });
+        let low = 0;
+        let high = serialized.length;
+        let compactValue = createCompactValue("");
+        while (low <= high) {
+          const midpoint = Math.floor((low + high) / 2);
+          const candidate = createCompactValue(
+            serialized.slice(0, midpoint),
+          );
+          if (countTokens(JSON.stringify(candidate)) <= maxResultTokens) {
+            compactValue = candidate;
+            low = midpoint + 1;
+          } else {
+            high = midpoint - 1;
+          }
+        }
+
+        return {
+          ...part,
+          output: {
+            type: "json" as const,
+            value: compactValue,
+          },
+        };
+      }),
+    };
+  });
+
+  return { messages: compactedMessages, compactedCount };
 }
 
 export function estimateInputTokens({

@@ -39,7 +39,24 @@ test("returns a result error for an unknown or misspelled city", async () => {
   });
 
   assert.equal(result.ok, false);
-  if (!result.ok) assert.equal(result.code, "location-not-found");
+  if (!result.ok) {
+    assert.equal(result.code, "location-not-found");
+    assert.equal(result.retryable, false);
+  }
+});
+
+test("marks rate limits and provider server errors as retryable", async () => {
+  for (const status of [429, 500, 503]) {
+    const result = await fetchCurrentWeather({
+      location: "Pune, IN",
+      units: "metric",
+      apiKey: "test-key",
+      fetcher: async () => new Response(null, { status }),
+    });
+
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.retryable, true);
+  }
 });
 
 test("returns a result error when the API key is missing", async () => {
