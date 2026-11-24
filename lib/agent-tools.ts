@@ -2,6 +2,20 @@ const notes = {
   meeting: "Notes from Tuesday: review the launch checklist and assign follow-up owners.",
 };
 
+const refundPolicy =
+  "Orders delivered within the last 30 days are eligible for a refund if the item is unopened. Refunds over ₹1,000 require manager sign-off.";
+
+const orders = {
+  "123": {
+    orderId: "123",
+    amount: 5_000,
+    currency: "INR",
+    daysSincePurchase: 5,
+    status: "delivered",
+    opened: false,
+  },
+};
+
 const MAX_EXPRESSION_LENGTH = 256;
 
 class ArithmeticParser {
@@ -117,4 +131,48 @@ export function searchNotes(query: string) {
     .map(([title, content]) => ({ title, content }));
 
   return { query, results };
+}
+
+export function searchRefundPolicy(query: string) {
+  return {
+    query,
+    policy: refundPolicy,
+  };
+}
+
+export function getOrderDetails(orderId: string) {
+  const order = orders[orderId as keyof typeof orders];
+  return order
+    ? { ok: true as const, order }
+    : { ok: false as const, error: `Order ${orderId} was not found.` };
+}
+
+export function simulateRefund(orderId: string, amount: number) {
+  const result = getOrderDetails(orderId);
+  if (!result.ok) return result;
+  if (
+    result.order.status !== "delivered" ||
+    result.order.opened ||
+    result.order.daysSincePurchase > 30
+  ) {
+    return {
+      ok: false as const,
+      error: "The order does not meet the refund policy criteria.",
+    };
+  }
+  if (amount !== result.order.amount) {
+    return {
+      ok: false as const,
+      error: `The refund amount must match the order total of ₹${result.order.amount}.`,
+    };
+  }
+
+  return {
+    ok: true as const,
+    status: "simulated" as const,
+    orderId,
+    amount,
+    currency: result.order.currency,
+    message: "Refund simulated; no payment was issued.",
+  };
 }

@@ -3,7 +3,14 @@ import { z } from "zod";
 import { logStructuredEvent } from "@/lib/llm";
 import { getRuntimeLogs } from "@/lib/runtime-logs";
 import { fetchCurrentWeather } from "@/lib/weather";
-import { calculate, getCurrentTime, searchNotes } from "@/lib/agent-tools";
+import {
+  calculate,
+  getCurrentTime,
+  getOrderDetails,
+  searchNotes,
+  searchRefundPolicy,
+  simulateRefund,
+} from "@/lib/agent-tools";
 import { createAgentToolExecutor } from "@/lib/agent-tool-executor";
 
 export const CHAT_TOOL_INSTRUCTIONS = [
@@ -14,6 +21,7 @@ export const CHAT_TOOL_INSTRUCTIONS = [
   "Use search_notes when the user asks about saved notes.",
   "Use get_weather when the user asks for current weather. If it returns ok=false, explain the error and do not invent weather data.",
   "Use get_recent_usage when the user asks about token usage or recent request performance. This reads only this chat's locally captured usage events.",
+  "For refund questions, search_refund_policy first, then get_order_details. Only call refund_order after confirming the order meets the policy. refund_order is simulated and always requires explicit human approval.",
 ].join(" ");
 
 const timeInputSchema = z.object({});
@@ -31,6 +39,28 @@ const weatherInputSchema = z.object({
 const usageInputSchema = z.object({
   limit: z.number().int().min(1).max(10).default(5),
 });
+
+const refundPolicyInputSchema = z.object({
+  query: z.string().trim().min(1).max(120).describe("Refund policy detail to look up"),
+});
+const orderInputSchema = z.object({
+  orderId: z.string().trim().min(1).max(32).describe("Order identifier, such as 123"),
+});
+const refundInputSchema = z.object({
+  orderId: z.string().trim().min(1).max(32).describe("Order identifier"),
+  amount: z.number().positive().max(1_000_000).describe("Refund amount in INR"),
+});
+
+export const CHAT_TOOL_INPUT_SCHEMAS = {
+  get_time: timeInputSchema,
+  calculator: calculatorInputSchema,
+  search_notes: searchNotesInputSchema,
+  get_weather: weatherInputSchema,
+  get_recent_usage: usageInputSchema,
+  search_refund_policy: refundPolicyInputSchema,
+  get_order_details: orderInputSchema,
+  refund_order: refundInputSchema,
+};
 
 export const CHAT_TOOL_SCHEMAS = [
   {
@@ -58,6 +88,22 @@ export const CHAT_TOOL_SCHEMAS = [
     description:
       "Summarize recent token usage and response latency for this chat from the app's local runtime logs.",
     inputSchema: z.toJSONSchema(usageInputSchema),
+  },
+  {
+    name: "search_refund_policy",
+    description: "Search the demo refund policy before making a refund decision.",
+    inputSchema: z.toJSONSchema(refundPolicyInputSchema),
+  },
+  {
+    name: "get_order_details",
+    description: "Fetch details for a demo order.",
+    inputSchema: z.toJSONSchema(orderInputSchema),
+  },
+  {
+    name: "refund_order",
+    description:
+      "Simulate a refund for an eligible demo order. This action always requires human approval and never issues a real payment.",
+    inputSchema: z.toJSONSchema(refundInputSchema),
   },
 ];
 
@@ -158,5 +204,43 @@ export function createChatTools(chatId: string) {
           };
         }),
     }),
+    search_refund_policy: tool({
+      description: "Search the demo refund policy before making a refund decision.",
+      inputSchema: refundPolicyInputSchema,
+      execute: async ({ query }) =>
+        executeTool("search_refund_policy", { query }, () =>
+          searchRefundPolicy(query),
+        ),
+    }),
+    get_order_details: tool({
+      description: "Fetch details for a demo order.",
+      inputSchema: orderInputSchema,
+      execute: async ({ orderId }) =>
+        executeTool("get_order_details", { orderId }, () =>
+          getOrderDetails(orderId),
+        ),
+    }),
+    refund_order: tool({
+      description:
+        "Simulate a refund for an eligible demo order. This action always requires human approval and never issues a real payment.",
+      inputSchema: refundInputSchema,
+      needsApproval: true,
+      execute: async ({ orderId, amount }) =>
+        executeTool("refund_order", { orderId, amount }, () =>
+          simulateRefund(orderId, amount),
+        ),
+    }),
   };
+}
+
+export function validateChatToolInput(toolName: string, input: unknown) {
+  if (!Object.hasOwn(CHAT_TOOL_INPUT_SCHEMAS, toolName)) {
+    throw new Error(`Unknown tool "${toolName}".`);
+  }
+
+  const schema =
+    CHAT_TOOL_INPUT_SCHEMAS[
+      toolName as keyof typeof CHAT_TOOL_INPUT_SCHEMAS
+    ];
+  return schema.parse(input);
 }

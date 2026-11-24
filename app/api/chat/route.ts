@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import {
+  validateUIMessages,
   convertToModelMessages,
   createUIMessageStream,
   createUIMessageStreamResponse,
@@ -8,6 +9,7 @@ import {
   type UIMessage,
 } from "ai";
 import { countTokens } from "gpt-tokenizer/model/gpt-oss-120b";
+import { z } from "zod";
 import {
   LLM_MAX_OUTPUT_TOKENS,
   logStructuredEvent,
@@ -17,7 +19,14 @@ import {
   CHAT_TOOL_INSTRUCTIONS,
   CHAT_TOOL_SCHEMAS,
   createChatTools,
+  validateChatToolInput,
 } from "@/lib/chat-tools";
+import {
+  beginChatRun,
+  finishChatRun,
+  getChatSession,
+  prepareSessionTransition,
+} from "@/lib/chat-session-store";
 import {
   getRunTokenTotal,
   isRunTokenBudgetExceeded,
@@ -34,6 +43,10 @@ import { SYSTEM_PROMPTS } from "@/lib/prompts";
 export const maxDuration = 30; // Max execution time for serverless deployment
 
 const MAX_CONTEXT_TOKENS = 131_072;
+const chatRequestSchema = z.object({
+  chatId: z.string().uuid(),
+  messages: z.array(z.unknown()).min(1).max(100),
+});
 const CHAT_SYSTEM_PROMPT = `${SYSTEM_PROMPTS.defaultAssistant}\n\n${CHAT_TOOL_INSTRUCTIONS}`;
 const DEFAULT_INPUT_TOKEN_BUDGET = 120_000;
 const configuredInputTokenBudget = Number(
@@ -104,11 +117,88 @@ async function saveMessageToDatabase(data: {
   });
 }
 
+export async function GET(req: Request) {
+  const chatIdResult = z.string().uuid().safeParse(
+    new URL(req.url).searchParams.get("chatId"),
+  );
+  if (!chatIdResult.success) {
+    return Response.json({ error: "A valid chatId is required." }, { status: 400 });
+  }
+
+  try {
+    const session = await getChatSession(chatIdResult.data);
+    return Response.json(
+      session ?? {
+        chatId: chatIdResult.data,
+        messages: [],
+        pendingToolCalls: [],
+        stepCount: 0,
+        status: "ready",
+      },
+    );
+  } catch (error) {
+    logStructuredEvent("chat.session.persistence.error", {
+      chatId: chatIdResult.data,
+      operation: "load",
+      errorType: error instanceof Error ? error.name : typeof error,
+    });
+    return Response.json(
+      { error: "Unable to load the saved chat session." },
+      { status: 500 },
+    );
+  }
+}
+
 export async function POST(req: Request) {
-  const { messages, chatId = "default-chat-id" }: {
-    messages: UIMessage[];
-    chatId?: string;
-  } = await req.json();
+  let requestBody: unknown;
+  try {
+    requestBody = await req.json();
+  } catch {
+    return Response.json({ error: "Request body must be valid JSON." }, { status: 400 });
+  }
+
+  const parsedBody = chatRequestSchema.safeParse(requestBody);
+  if (!parsedBody.success) {
+    return Response.json(
+      { error: "A valid chatId and message history are required." },
+      { status: 400 },
+    );
+  }
+
+  const { chatId } = parsedBody.data;
+  const tools = createChatTools(chatId);
+  let messages: UIMessage[];
+  try {
+    messages = await validateUIMessages<UIMessage>({
+      messages: parsedBody.data.messages,
+    });
+  } catch (error) {
+    return Response.json(
+      {
+        error:
+          error instanceof Error
+            ? `Invalid chat messages: ${error.message}`
+            : "Invalid chat messages.",
+      },
+      { status: 400 },
+    );
+  }
+
+  let session;
+  try {
+    session = await getChatSession(chatId);
+    prepareSessionTransition(session, messages, validateChatToolInput);
+  } catch (error) {
+    return Response.json(
+      {
+        error:
+          error instanceof Error
+            ? error.message
+            : "The saved chat session is not available.",
+      },
+      { status: 409 },
+    );
+  }
 
   const requestId = randomUUID();
   const startedAt = Date.now();
@@ -164,6 +254,30 @@ export async function POST(req: Request) {
     );
   }
 
+  let runState;
+  try {
+    runState = await beginChatRun(chatId, messages, validateChatToolInput);
+  } catch (error) {
+    logStructuredEvent("chat.session.persistence.error", {
+      chatId,
+      operation: "begin",
+      errorType: error instanceof Error ? error.name : typeof error,
+    });
+    return Response.json(
+      {
+        error:
+          error instanceof Error
+            ? error.message
+            : "Unable to start the chat session.",
+      },
+      { status: 409 },
+    );
+  }
+
+  const trustedMessages = runState.messages;
+  const trustedModelMessages = await convertToModelMessages(trustedMessages);
+  let completedSteps = runState.stepCount;
+
   const stream = createUIMessageStream({
     execute: ({ writer }) => {
       let partialResponse = "";
@@ -203,11 +317,11 @@ export async function POST(req: Request) {
         chatId,
         estimatedInputTokens,
         system: CHAT_SYSTEM_PROMPT,
-        messages: modelMessages,
-        tools: createChatTools(chatId),
+        messages: trustedModelMessages,
+        tools,
         toolCallConcurrency: 5,
         stopWhen: [
-          isStepCount(MAX_TOOL_STEPS),
+          isStepCount(Math.max(1, MAX_TOOL_STEPS - runState.stepCount)),
           ({ steps }) => {
             tokenBudgetExceeded = isRunTokenBudgetExceeded({ steps });
             if (tokenBudgetExceeded) {
@@ -230,6 +344,10 @@ export async function POST(req: Request) {
           if (chunk.type === "text-delta") {
             partialResponse += chunk.text;
           }
+        },
+
+        onStepEnd() {
+          completedSteps += 1;
         },
 
         async onFinish({ text, usage }) {
@@ -278,7 +396,29 @@ export async function POST(req: Request) {
         },
       });
 
-      writer.merge(toUIMessageStream({ stream: result.stream }));
+      writer.merge(
+        toUIMessageStream({
+          stream: result.stream,
+          tools,
+          originalMessages: trustedMessages,
+          async onEnd({ messages: completedMessages }) {
+            try {
+              await finishChatRun({
+                chatId,
+                messages: completedMessages,
+                stepCount: completedSteps,
+              });
+            } catch (error) {
+              logStructuredEvent("chat.session.persistence.error", {
+                chatId,
+                operation: "checkpoint",
+                errorType: error instanceof Error ? error.name : typeof error,
+              });
+              throw error;
+            }
+          },
+        }),
+      );
     },
   });
 
