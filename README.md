@@ -69,3 +69,11 @@ npm run lint
 npx tsc --noEmit
 npm test
 ```
+
+## Day 19 LangGraph evaluation
+
+The Day 19 LangGraph implementation is available at `/ui/langgraph` and
+`/api/langgraph`. It demonstrates graph state, conditional routing, streamed
+node updates, and an approval interrupt backed by an in-memory checkpointer.
+See `docs/day-19-state-orchestration.md` for the hand-built versus LangGraph
+decision.
