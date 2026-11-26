@@ -1,6 +1,7 @@
 import { isDeepStrictEqual } from "node:util";
 import type { UIMessage } from "ai";
-import { Pool, type QueryResultRow } from "pg";
+import { type QueryResultRow } from "pg";
+import { getDatabasePool } from "@/lib/database";
 
 export type PendingToolCall = {
   approvalId: string;
@@ -25,6 +26,7 @@ type ChatSessionRow = QueryResultRow & {
   step_count: number;
   run_token_count: number;
   status: ChatSession["status"];
+  user_id: string | null;
 };
 
 type SessionTransition = {
@@ -38,58 +40,6 @@ type ChatToolPart = Extract<
   UIMessage["parts"][number],
   { type: `tool-${string}` }
 >;
-
-let pool: Pool | undefined;
-let schemaPromise: Promise<void> | undefined;
-
-function getPool() {
-  if (!pool) {
-    const connectionString =
-      process.env.DATABASE_URL ??
-      (process.env.NODE_ENV === "production"
-        ? undefined
-        : "postgresql://postgres:postgres@localhost:5432/rag_db");
-
-    if (!connectionString) {
-      throw new Error("DATABASE_URL must be configured for chat persistence.");
-    }
-
-    pool = new Pool({ connectionString, max: 5 });
-  }
-
-  return pool;
-}
-
-async function ensureSchema() {
-  if (!schemaPromise) {
-    schemaPromise = getPool()
-      .query(`
-        CREATE TABLE IF NOT EXISTS chat_agent_sessions (
-          chat_id uuid PRIMARY KEY,
-          messages jsonb NOT NULL,
-          pending_tool_calls jsonb NOT NULL DEFAULT '[]'::jsonb,
-          step_count integer NOT NULL DEFAULT 0,
-          run_token_count integer NOT NULL DEFAULT 0,
-          status text NOT NULL CHECK (
-            status IN ('running', 'ready', 'awaiting_approval', 'failed')
-          ),
-          updated_at timestamptz NOT NULL DEFAULT now()
-        )
-      `)
-      .then(() =>
-        getPool().query(
-          "ALTER TABLE chat_agent_sessions ADD COLUMN IF NOT EXISTS run_token_count integer NOT NULL DEFAULT 0",
-        ),
-      )
-      .then(() => undefined)
-      .catch((error: unknown) => {
-        schemaPromise = undefined;
-        throw error;
-      });
-  }
-
-  await schemaPromise;
-}
 
 function getPendingToolCalls(messages: UIMessage[]): PendingToolCall[] {
   const pending: PendingToolCall[] = [];
@@ -120,6 +70,15 @@ function getPendingToolCalls(messages: UIMessage[]): PendingToolCall[] {
 
 function isToolPart(part: UIMessage["parts"][number]): part is ChatToolPart {
   return part.type.startsWith("tool-") && "toolCallId" in part;
+}
+
+function isPersistedJsonEqual(left: unknown, right: unknown): boolean {
+  const normalize = (value: unknown) => {
+    const serialized = JSON.stringify(value);
+    return serialized === undefined ? undefined : JSON.parse(serialized);
+  };
+
+  return isDeepStrictEqual(normalize(left), normalize(right));
 }
 
 function findToolPart(
@@ -172,7 +131,7 @@ export function prepareSessionTransition(
     if (
       incomingMessages.length !== session.messages.length + 1 ||
       incomingMessages[incomingMessages.length - 1]?.role !== "user" ||
-      !isDeepStrictEqual(
+      !isPersistedJsonEqual(
         incomingMessages.slice(0, -1),
         session.messages,
       )
@@ -237,7 +196,7 @@ export function prepareSessionTransition(
       },
     };
 
-    if (!isDeepStrictEqual(expectedPart, incomingPart.part)) {
+    if (!isPersistedJsonEqual(expectedPart, incomingPart.part)) {
       throw new Error("The chat history contains changes beyond the approval decision.");
     }
 
@@ -250,7 +209,7 @@ export function prepareSessionTransition(
     throw new Error("All pending actions need an approval decision before resuming.");
   }
 
-  if (!isDeepStrictEqual(expectedMessages, incomingMessages)) {
+  if (!isPersistedJsonEqual(expectedMessages, incomingMessages)) {
     throw new Error("The chat history contains changes beyond the approval decision.");
   }
 
@@ -272,13 +231,12 @@ function toChatSession(row: ChatSessionRow): ChatSession {
   };
 }
 
-export async function getChatSession(chatId: string) {
-  await ensureSchema();
-  const result = await getPool().query<ChatSessionRow>(
-    `SELECT chat_id, messages, pending_tool_calls, step_count, run_token_count, status
+export async function getChatSession(chatId: string, userId: string | null) {
+  const result = await getDatabasePool().query<ChatSessionRow>(
+    `SELECT chat_id, messages, pending_tool_calls, step_count, run_token_count, status, user_id
      FROM chat_agent_sessions
-     WHERE chat_id = $1`,
-    [chatId],
+     WHERE chat_id = $1 AND user_id IS NOT DISTINCT FROM $2`,
+    [chatId, userId],
   );
 
   return result.rows[0] ? toChatSession(result.rows[0]) : null;
@@ -286,20 +244,20 @@ export async function getChatSession(chatId: string) {
 
 export async function beginChatRun(
   chatId: string,
+  userId: string | null,
   incomingMessages: UIMessage[],
   validateToolInput: ToolInputValidator,
 ) {
-  await ensureSchema();
-  const client = await getPool().connect();
+  const client = await getDatabasePool().connect();
 
   try {
     await client.query("BEGIN");
     const result = await client.query<ChatSessionRow>(
-      `SELECT chat_id, messages, pending_tool_calls, step_count, run_token_count, status
+      `SELECT chat_id, messages, pending_tool_calls, step_count, run_token_count, status, user_id
        FROM chat_agent_sessions
-       WHERE chat_id = $1
+       WHERE chat_id = $1 AND user_id IS NOT DISTINCT FROM $2
        FOR UPDATE`,
-      [chatId],
+      [chatId, userId],
     );
     const existing = result.rows[0] ? toChatSession(result.rows[0]) : null;
     const transition = prepareSessionTransition(
@@ -314,21 +272,23 @@ export async function beginChatRun(
          SET messages = $2, pending_tool_calls = '[]'::jsonb,
              step_count = $3, run_token_count = $4,
              status = 'running', updated_at = now()
-         WHERE chat_id = $1`,
+         WHERE chat_id = $1 AND user_id IS NOT DISTINCT FROM $5`,
         [
           chatId,
           JSON.stringify(transition.messages),
           transition.stepCount,
           transition.runTokenCount,
+          userId,
         ],
       );
     } else {
       await client.query(
         `INSERT INTO chat_agent_sessions
-          (chat_id, messages, pending_tool_calls, step_count, run_token_count, status)
-         VALUES ($1, $2, '[]'::jsonb, $3, $4, 'running')`,
+          (chat_id, user_id, messages, pending_tool_calls, step_count, run_token_count, status)
+         VALUES ($1, $2, $3, '[]'::jsonb, $4, $5, 'running')`,
         [
           chatId,
+          userId,
           JSON.stringify(transition.messages),
           transition.stepCount,
           transition.runTokenCount,
@@ -348,23 +308,24 @@ export async function beginChatRun(
 
 export async function finishChatRun({
   chatId,
+  userId,
   messages,
   stepCount,
   runTokenCount,
 }: {
   chatId: string;
+  userId: string | null;
   messages: UIMessage[];
   stepCount: number;
   runTokenCount: number;
 }) {
-  await ensureSchema();
   const pendingToolCalls = getPendingToolCalls(messages);
   const status = pendingToolCalls.length > 0 ? "awaiting_approval" : "ready";
-  const result = await getPool().query(
+  const result = await getDatabasePool().query(
     `UPDATE chat_agent_sessions
      SET messages = $2, pending_tool_calls = $3, step_count = $4,
          run_token_count = $5, status = $6, updated_at = now()
-     WHERE chat_id = $1 AND status = 'running'`,
+     WHERE chat_id = $1 AND user_id IS NOT DISTINCT FROM $7 AND status = 'running'`,
     [
       chatId,
       JSON.stringify(messages),
@@ -372,6 +333,7 @@ export async function finishChatRun({
       stepCount,
       runTokenCount,
       status,
+      userId,
     ],
   );
 

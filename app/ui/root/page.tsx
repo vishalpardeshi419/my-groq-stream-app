@@ -1,8 +1,10 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { useRouter } from "next/navigation";
 import { Check, FileText, Pencil, Send, ShieldAlert, Square, X } from "lucide-react";
 import { useChat } from "@ai-sdk/react";
+import { authClient } from "@/lib/auth-client";
 import {
   DefaultChatTransport,
   lastAssistantMessageIsCompleteWithApprovalResponses,
@@ -46,25 +48,24 @@ function partInput(part: ChatMessage["parts"][number]) {
 }
 
 export default function ChatComponent() {
+  const router = useRouter();
+  const { data: authSession, isPending: isAuthPending } = authClient.useSession();
   const [input, setInput] = useState("");
   const [auditMetrics, setAuditMetrics] = useState<TokenAuditMetrics | null>(null);
   const [chatId, setChatId] = useState("");
-  const [isRestoring, setIsRestoring] = useState(true);
+  const [loadedOwnerKey, setLoadedOwnerKey] = useState<string | null>(null);
   const [restoreError, setRestoreError] = useState("");
   const [editingApprovalId, setEditingApprovalId] = useState<string | null>(null);
   const [editedInputs, setEditedInputs] = useState<Record<string, string>>({});
   const [declineReason, setDeclineReason] = useState(defaultDeclineReason);
-  const chatIdRef = useRef("");
-
   const transport = useMemo(
-    () =>
-      new DefaultChatTransport<ChatMessage>({
-        api: "/api/chat",
-        prepareSendMessagesRequest: ({ messages }) => ({
-          body: { chatId: chatIdRef.current, messages },
-        }),
+    () => new DefaultChatTransport<ChatMessage>({
+      api: "/api/chat",
+      prepareSendMessagesRequest: ({ messages }) => ({
+        body: { chatId, messages },
       }),
-    [],
+    }),
+    [chatId],
   );
   const {
     messages,
@@ -88,12 +89,15 @@ export default function ChatComponent() {
   });
 
   useEffect(() => {
-    const savedChatId = window.localStorage.getItem("groq-stream-chat-id");
-    const nextChatId = savedChatId ?? window.crypto.randomUUID();
-    window.localStorage.setItem("groq-stream-chat-id", nextChatId);
-    chatIdRef.current = nextChatId;
-    setChatId(nextChatId);
+    if (isAuthPending) return;
 
+    const ownerKey = authSession?.user.id ?? "anonymous";
+    const storageKey = authSession?.user.id
+      ? `groq-stream-chat-id:${authSession.user.id}`
+      : "groq-stream-chat-id";
+    const savedChatId = window.localStorage.getItem(storageKey);
+    const nextChatId = savedChatId ?? window.crypto.randomUUID();
+    window.localStorage.setItem(storageKey, nextChatId);
     fetch(`/api/chat?chatId=${encodeURIComponent(nextChatId)}`)
       .then(async (response) => {
         if (!response.ok) {
@@ -101,7 +105,10 @@ export default function ChatComponent() {
         }
         return (await response.json()) as { messages: ChatMessage[] };
       })
-      .then(({ messages: savedMessages }) => setMessages(savedMessages))
+      .then(({ messages: savedMessages }) => {
+        setMessages(savedMessages);
+        setRestoreError("");
+      })
       .catch((restoreError: unknown) => {
         setRestoreError(
           restoreError instanceof Error
@@ -109,9 +116,15 @@ export default function ChatComponent() {
             : "Unable to load the saved conversation.",
         );
       })
-      .finally(() => setIsRestoring(false));
-  }, [setMessages]);
+      .finally(() => {
+        setChatId(nextChatId);
+        setLoadedOwnerKey(ownerKey);
+      });
+  }, [authSession?.user.id, isAuthPending, setMessages]);
 
+  const isRestoring =
+    isAuthPending ||
+    loadedOwnerKey !== (authSession?.user.id ?? "anonymous");
   const isLoading = status === "submitted" || status === "streaming";
   const pendingApproval = messages.some((message) =>
     message.parts.some(
@@ -181,6 +194,45 @@ export default function ChatComponent() {
             <FileText aria-hidden="true" className="h-4 w-4" />
             Logs
           </a>
+          <div className="flex items-center gap-3 text-sm">
+            {isAuthPending ? (
+              <span className="text-gray-500" role="status">Checking session…</span>
+            ) : authSession ? (
+              <>
+                <a
+                  href="/account/security"
+                  className="text-blue-600 hover:underline"
+                >
+                  Security
+                </a>
+                <span className="hidden text-gray-500 sm:inline">
+                  {authSession.user.email}
+                </span>
+                <button
+                  type="button"
+                  onClick={async () => {
+                    try {
+                      const result = await authClient.signOut();
+                      if (result.error) {
+                        setRestoreError("Unable to sign out. Please try again.");
+                        return;
+                      }
+                      router.replace("/login");
+                    } catch {
+                      setRestoreError("Unable to sign out. Please try again.");
+                    }
+                  }}
+                  className="text-blue-600 hover:underline"
+                >
+                  Sign out
+                </button>
+              </>
+            ) : (
+              <a href="/login" className="text-blue-600 hover:underline">
+                Sign in
+              </a>
+            )}
+          </div>
         </div>
       </header>
 

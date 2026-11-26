@@ -15,7 +15,9 @@ Install dependencies:
 npm install
 ```
 
-Create `.env.local` in the project root and add your Groq API key:
+Create `.env.local` in the project root using `.env.example` as a template. Set the
+Groq and OpenWeather keys, `DATABASE_URL` when using a non-default database, and
+the authentication/email values described below.
 
 ```env
 GROQ_API_KEY=your_groq_api_key
@@ -34,6 +36,66 @@ LLM_LOG_CONTENT=false
 # LLM_FAULT_MODE=http-500
 # LLM_FAULT_RATE=0.5
 ```
+
+For authentication, also configure:
+
+```env
+BETTER_AUTH_SECRET= # Generate with: openssl rand -base64 32
+BETTER_AUTH_URL=http://localhost:3000
+GOOGLE_CLIENT_ID=
+GOOGLE_CLIENT_SECRET=
+SMTP_HOST=
+SMTP_PORT=587
+SMTP_USER=
+SMTP_PASSWORD=
+SMTP_FROM=
+```
+
+`BETTER_AUTH_SECRET` and `BETTER_AUTH_URL` are required in production. Google
+credentials enable Google sign-in; email verification and password reset require a
+working SMTP account. Never expose these values through `NEXT_PUBLIC_*`.
+
+Apply the versioned schema before starting the application:
+
+```bash
+npm run db:migrate
+npm run dev
+```
+
+The migration runner creates Better Auth tables and adds a nullable `user_id` to
+`chat_agent_sessions`. Existing anonymous rows remain in place with `user_id = NULL`;
+they remain accessible only through the existing anonymous chat-ID flow and are not
+automatically claimed by a newly signed-in account. New authenticated chats are
+stored under the user ID from the server-verified session. The migration deliberately
+does not make `user_id` non-null.
+
+In Google Cloud Console, create an OAuth 2.0 Web application client, configure the
+authorized JavaScript origin as `http://localhost:3000` (and the production origin),
+and add the authorized redirect URI
+`http://localhost:3000/api/auth/callback/google` (plus its production equivalent).
+Google handles proof of Google identity and any Google-side MFA. The app’s TOTP
+second factor applies to email/password sign-ins; Google sign-in is not represented
+as application-managed 2FA.
+
+If a verification message is missed, users can request another at
+`/resend-verification`. The response is intentionally generic and requests are
+rate-limited.
+
+Passkeys/WebAuthn are a suitable future addition: they are phishing-resistant and
+Better Auth has a passkey plugin, but this implementation does not enable them.
+
+Security implementation notes:
+
+- Passwords use Argon2id; sessions, verification links, and rate-limit counters are
+  stored in PostgreSQL. OAuth tokens are encrypted by Better Auth at rest.
+- Better Auth’s TOTP plugin stores recovery codes encrypted (not as one-way hashes)
+  because it must retrieve the codes to verify them. It enforces one-time use and
+  account lockout, but its TOTP verifier currently does not expose replay detection
+  for previously accepted codes. These are known differences from the requested
+  hash-only recovery storage and TOTP replay prevention, so do not treat this
+  implementation as production-ready until they are addressed and tested.
+- The repository's current Next.js 16.4.2 release is affected by published security
+  advisories; upgrade to a fixed Next.js release before production deployment.
 
 Start the development server:
 

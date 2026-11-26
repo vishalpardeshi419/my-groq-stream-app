@@ -56,6 +56,59 @@ function createApprovalMessages(approved: boolean) {
   };
 }
 
+test("matches stored history using its JSON-persisted representation", () => {
+  const savedMessages: UIMessage[] = [
+    {
+      id: "user-1",
+      role: "user",
+      parts: [{ type: "text", text: "Hello" }],
+    },
+  ];
+  const clientHistory = structuredClone(savedMessages);
+  Object.assign(clientHistory[0], { clientOnly: undefined });
+
+  const incomingMessages: UIMessage[] = [
+    ...clientHistory,
+    {
+      id: "user-2",
+      role: "user",
+      parts: [{ type: "text", text: "Next question" }],
+    },
+  ];
+
+  assert.doesNotThrow(() =>
+    prepareSessionTransition(
+      {
+        messages: savedMessages,
+        pendingToolCalls: [],
+        stepCount: 1,
+        runTokenCount: 20,
+        status: "ready",
+      },
+      incomingMessages,
+      (_toolName, input) => input,
+    ),
+  );
+
+  const tamperedMessages = structuredClone(incomingMessages);
+  tamperedMessages[0].parts[0] = { type: "text", text: "Changed history" };
+  assert.throws(
+    () =>
+      prepareSessionTransition(
+        {
+          messages: savedMessages,
+          pendingToolCalls: [],
+          stepCount: 1,
+          runTokenCount: 20,
+          status: "ready",
+        },
+        tamperedMessages,
+        (_toolName, input) => input,
+      ),
+    /submitted chat history does not match/,
+  );
+});
+
 test("ten Day 18-style tool and approval scenarios recover without stack traces", async () => {
   const trace: string[] = [];
   const attemptCounts = new Map<string, number>();

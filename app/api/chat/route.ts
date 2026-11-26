@@ -11,6 +11,7 @@ import {
 } from "ai";
 import { countTokens } from "gpt-tokenizer/model/gpt-oss-120b";
 import { z } from "zod";
+import { auth } from "@/lib/auth";
 import {
   LLM_MAX_OUTPUT_TOKENS,
   logStructuredEvent,
@@ -133,7 +134,11 @@ export async function GET(req: Request) {
   }
 
   try {
-    const session = await getChatSession(chatIdResult.data);
+    const authSession = await auth.api.getSession({ headers: req.headers });
+    const session = await getChatSession(
+      chatIdResult.data,
+      authSession?.user.id ?? null,
+    );
     return Response.json(
       session ?? {
         chatId: chatIdResult.data,
@@ -173,6 +178,21 @@ export async function POST(req: Request) {
   }
 
   const { chatId } = parsedBody.data;
+  let userId: string | null;
+  try {
+    const authSession = await auth.api.getSession({ headers: req.headers });
+    userId = authSession?.user.id ?? null;
+  } catch (error) {
+    logStructuredEvent("chat.session.authentication.error", {
+      chatId,
+      errorType: error instanceof Error ? error.name : typeof error,
+    });
+    return Response.json(
+      { error: "Unable to verify the current session." },
+      { status: 500 },
+    );
+  }
+
   let messages: UIMessage[];
   try {
     messages = await validateUIMessages<UIMessage>({
@@ -192,7 +212,7 @@ export async function POST(req: Request) {
 
   let session;
   try {
-    session = await getChatSession(chatId);
+    session = await getChatSession(chatId, userId);
     prepareSessionTransition(session, messages, validateChatToolInput);
   } catch (error) {
     return Response.json(
@@ -270,7 +290,12 @@ export async function POST(req: Request) {
 
   let runState;
   try {
-    runState = await beginChatRun(chatId, messages, validateChatToolInput);
+    runState = await beginChatRun(
+      chatId,
+      userId,
+      messages,
+      validateChatToolInput,
+    );
   } catch (error) {
     logStructuredEvent("chat.session.persistence.error", {
       chatId,
@@ -592,6 +617,7 @@ export async function POST(req: Request) {
                   : completedMessages;
               await finishChatRun({
                 chatId,
+                userId,
                 messages: checkpointMessages,
                 stepCount: completedSteps,
                 runTokenCount: completedRunTokens,
