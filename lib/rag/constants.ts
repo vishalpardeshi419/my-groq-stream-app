@@ -1,0 +1,9 @@
+export const RAG_EMBEDDING_MODEL = "nomic-ai/nomic-embed-text-v1.5";
+export const RAG_EMBEDDING_DIMENSIONS = 768;
+export const RAG_CHUNK_SIZE_TOKENS = 500;
+export const RAG_CHUNK_OVERLAP_TOKENS = 75;
+export const RAG_MAX_DOCUMENT_BYTES = 10 * 1024 * 1024;
+export const RAG_MAX_DOCUMENT_TOKENS = 50_000;
+export const RAG_MAX_CHUNKS = 100;
+export const RAG_MAX_SEARCH_RESULTS = 10;
+export const RAG_OCR_TIMEOUT_MS = 120_000;

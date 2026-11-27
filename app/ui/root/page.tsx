@@ -194,6 +194,14 @@ export default function ChatComponent() {
             <FileText aria-hidden="true" className="h-4 w-4" />
             Logs
           </a>
+          {authSession && (
+            <a
+              href="/documents"
+              className="text-sm text-blue-600 hover:underline"
+            >
+              Documents
+            </a>
+          )}
           <div className="flex items-center gap-3 text-sm">
             {isAuthPending ? (
               <span className="text-gray-500" role="status">Checking session…</span>

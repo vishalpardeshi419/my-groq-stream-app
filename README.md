@@ -106,6 +106,52 @@ npm run dev
 Open [http://localhost:3000/ui/root](http://localhost:3000/ui/root).
 Open [http://localhost:3000/logs](http://localhost:3000/logs) to view development runtime logs.
 
+## Document ingestion (Days 8–9)
+
+Document embeddings run locally with Transformers.js and
+`nomic-ai/nomic-embed-text-v1.5`; no embedding API key is required. The model
+uses 8-bit weights and downloads from Hugging Face on the first embedding
+request, then remains cached in memory for the lifetime of that server process.
+The server needs network access for the initial download and enough memory and
+CPU to run local inference.
+
+Stop the app and run this one-time schema and re-embedding step:
+
+```bash
+npm run db:migrate
+npm run rag:reembed
+npm run dev
+```
+
+The migration adds a 768-dimensional vector column while retaining the old
+1536-dimensional vectors. The one-time re-embedding command rebuilds vectors
+from stored chunk text and only drops the old vectors after every document has
+been re-embedded. Documents and chunk text are preserved; on a fresh database,
+the backfill simply finalizes the 768-dimensional schema without downloading
+the model. UI uploads create embeddings automatically.
+
+Sign in and open `/documents` (also linked from the chat header).
+
+Upload a PDF, DOCX, Markdown, or UTF-8 TXT file up to 10 MB. The application
+extracts text, shows a preview, splits it into 500-token chunks with 75-token
+overlap, and creates 768-dimensional local embeddings. Markdown and DOCX
+headings are retained as section metadata; PDF pages are indexed separately.
+Uploaded chunks use the
+`search_document:` task prefix; search requests use `search_query:`. Scanned PDF
+pages are rendered and OCRed locally with Tesseract; install Tesseract with
+English language data (`brew install tesseract` on macOS, or `tesseract-ocr`
+and `tesseract-ocr-eng` on Debian/Ubuntu). Set `TESSERACT_LANG` to a Tesseract
+language code or language combination when needed; it defaults to `eng`. OCR
+has a two-minute processing timeout and does not send documents to an OCR
+service. Each account's documents and search results are scoped to its verified
+server-side session.
+
+Try a query such as `refund policy` and inspect the returned chunks and source
+metadata. Search is vector-only cosine similarity; answer generation,
+citations, evaluation sets, hybrid retrieval, and reranking are later stages.
+Changing the embedding model or vector dimensions requires re-embedding stored
+documents and updating the matching database schema.
+
 ## Chat behavior
 
 - The client uses AI SDK's UI message stream to receive Groq responses and transient request metrics.
