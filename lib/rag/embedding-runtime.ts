@@ -1,72 +1,67 @@
-import {
-  layer_norm,
-  pipeline,
-  type FeatureExtractionPipeline,
-} from "@huggingface/transformers";
-import {
-  RAG_EMBEDDING_DIMENSIONS,
-  RAG_EMBEDDING_MODEL,
-} from "./constants";
+import { GoogleGenAI } from "@google/genai";
+import { RAG_EMBEDDING_DIMENSIONS, RAG_EMBEDDING_MODEL } from "./constants";
 
 const EMBEDDING_BATCH_SIZE = 8;
-const POOLING_OPTIONS = { pooling: "mean" as const };
 
-let extractorPromise: Promise<FeatureExtractionPipeline> | null = null;
+type RetrievalTaskType = "RETRIEVAL_DOCUMENT" | "RETRIEVAL_QUERY";
 
-function getExtractor() {
-  if (!extractorPromise) {
-    const loading = pipeline(
-      "feature-extraction",
-      RAG_EMBEDDING_MODEL,
-      { dtype: "q8" },
-    ).catch((error: unknown) => {
-      if (extractorPromise === loading) extractorPromise = null;
-      throw error;
-    });
-    extractorPromise = loading;
+let client: GoogleGenAI | undefined;
+
+function getGeminiClient() {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey?.trim()) {
+    throw new Error("GEMINI_API_KEY must be configured for document embeddings.");
   }
-  return extractorPromise;
+
+  client ??= new GoogleGenAI({ apiKey });
+  return client;
 }
 
-async function embedBatch(texts: string[], prefix: string) {
+export function normalizeEmbedding(vector: number[]) {
+  if (
+    vector.length !== RAG_EMBEDDING_DIMENSIONS ||
+    vector.some((value) => !Number.isFinite(value))
+  ) {
+    throw new Error("Gemini returned an invalid embedding vector.");
+  }
+
+  const norm = Math.sqrt(vector.reduce((sum, value) => sum + value * value, 0));
+  if (!Number.isFinite(norm)) {
+    throw new Error("Gemini returned an invalid embedding norm.");
+  }
+  return norm === 0 ? vector : vector.map((value) => value / norm);
+}
+
+async function embedBatch(
+  texts: string[],
+  taskType: RetrievalTaskType,
+): Promise<number[][]> {
   if (texts.length === 0) return [];
 
-  const extractor = await getExtractor();
-  const output = await extractor(
-    texts.map((text) => `${prefix}: ${text}`),
-    POOLING_OPTIONS,
-  );
-  if (
-    output.dims.length !== 2 ||
-    output.dims[0] !== texts.length ||
-    output.dims[1] !== RAG_EMBEDDING_DIMENSIONS
-  ) {
-    throw new Error("The local embedding model returned an unexpected shape.");
+  const response = await getGeminiClient().models.embedContent({
+    model: RAG_EMBEDDING_MODEL,
+    contents: texts,
+    config: {
+      taskType,
+      outputDimensionality: RAG_EMBEDDING_DIMENSIONS,
+    },
+  });
+  const embeddings = response.embeddings;
+  if (!embeddings || embeddings.length !== texts.length) {
+    throw new Error("Gemini returned an unexpected number of embeddings.");
   }
 
-  const normalized = layer_norm(output, [RAG_EMBEDDING_DIMENSIONS]).normalize(
-    2,
-    -1,
-  );
-  const values = Array.from(normalized.data);
-  if (
-    values.length !== texts.length * RAG_EMBEDDING_DIMENSIONS ||
-    values.some((value) => !Number.isFinite(value))
-  ) {
-    throw new Error("The local embedding model returned invalid values.");
-  }
-
-  return Array.from({ length: texts.length }, (_, index) =>
-    values.slice(
-      index * RAG_EMBEDDING_DIMENSIONS,
-      (index + 1) * RAG_EMBEDDING_DIMENSIONS,
-    ),
-  );
+  return embeddings.map((embedding) => {
+    if (!embedding.values) {
+      throw new Error("Gemini returned an empty embedding.");
+    }
+    return normalizeEmbedding(embedding.values);
+  });
 }
 
 export async function embedDocument(text: string): Promise<number[]> {
-  const [embedding] = await embedBatch([text], "search_document");
-  if (!embedding) throw new Error("The local embedding model returned no vector.");
+  const [embedding] = await embedBatch([text], "RETRIEVAL_DOCUMENT");
+  if (!embedding) throw new Error("Gemini returned no document embedding.");
   return embedding;
 }
 
@@ -76,7 +71,7 @@ export async function embedDocuments(texts: string[]): Promise<number[][]> {
     embeddings.push(
       ...(await embedBatch(
         texts.slice(offset, offset + EMBEDDING_BATCH_SIZE),
-        "search_document",
+        "RETRIEVAL_DOCUMENT",
       )),
     );
   }
@@ -84,7 +79,7 @@ export async function embedDocuments(texts: string[]): Promise<number[][]> {
 }
 
 export async function embedQuery(text: string): Promise<number[]> {
-  const [embedding] = await embedBatch([text], "search_query");
-  if (!embedding) throw new Error("The local embedding model returned no vector.");
+  const [embedding] = await embedBatch([text], "RETRIEVAL_QUERY");
+  if (!embedding) throw new Error("Gemini returned no query embedding.");
   return embedding;
 }

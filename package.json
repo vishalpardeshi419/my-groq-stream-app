@@ -16,7 +16,6 @@
     "@ai-sdk/openai": "4.0.96",
     "@ai-sdk/react": "^4.0.147",
     "@google/genai": "^3.6.1",
-    "@huggingface/transformers": "^4.3.2",
     "@types/pg": "^8.23.1",
     "ai": "^7.0.143",
     "argon2": "^0.45.2",

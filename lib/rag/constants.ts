@@ -1,4 +1,4 @@
-export const RAG_EMBEDDING_MODEL = "nomic-ai/nomic-embed-text-v1.5";
+export const RAG_EMBEDDING_MODEL = "gemini-embedding-001";
 export const RAG_EMBEDDING_DIMENSIONS = 768;
 export const RAG_CHUNK_SIZE_TOKENS = 500;
 export const RAG_CHUNK_OVERLAP_TOKENS = 75;

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { test } from "node:test";
 import { deflateSync } from "node:zlib";
+import { normalizeEmbedding } from "../lib/rag/embedding-runtime";
 import {
   chunkDocumentSections,
   countDocumentTokens,
@@ -85,6 +86,28 @@ function createScannedPdf(text: string) {
 
   return Buffer.concat([header, ...objects, xref]);
 }
+
+test("embedding vectors are validated and L2-normalized", () => {
+  const vector = Array.from({ length: 768 }, (_, index) =>
+    index === 0 ? 3 : index === 1 ? 4 : 0,
+  );
+  const normalized = normalizeEmbedding(vector);
+
+  assert.equal(normalized.length, 768);
+  assert.equal(normalized[0], 0.6);
+  assert.equal(normalized[1], 0.8);
+  assert.ok(Math.abs(Math.hypot(...normalized) - 1) < 1e-12);
+  assert.throws(() => normalizeEmbedding([1, 2]), /invalid embedding vector/);
+  assert.throws(
+    () =>
+      normalizeEmbedding(
+        Array.from({ length: 768 }, (_, index) =>
+          index ? 0 : Number.NaN,
+        ),
+      ),
+    /invalid embedding vector/,
+  );
+});
 
 test("chunks preserve page and heading metadata with bounded overlap", () => {
   const text = Array.from({ length: 1_200 }, (_, index) => `word${index}`).join(

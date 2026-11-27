@@ -264,7 +264,7 @@ export async function POST(request: Request) {
     return Response.json(
       {
         error:
-          "Unable to index this document with the local embedding model. Check server logs and retry.",
+          "Unable to index this document with Gemini embeddings. Check server logs and retry.",
       },
       { status: 503 },
     );

@@ -30,6 +30,8 @@ OPENAI_FALLBACK_MODEL=gpt-4.1-mini
 MAX_INPUT_TOKENS=120000
 # Optional. Enables raw prompt and response logging; keep disabled in production by default.
 LLM_LOG_CONTENT=false
+# Required for document upload and search embeddings; keep server-side only.
+GEMINI_API_KEY=your_gemini_api_key
 # Optional chaos switches; uncomment only for controlled local testing.
 # AGENT_FAULT_MODE=timeout
 # AGENT_FAULT_RATE=0.5
@@ -108,12 +110,12 @@ Open [http://localhost:3000/logs](http://localhost:3000/logs) to view developmen
 
 ## Document ingestion (Days 8–9)
 
-Document embeddings run locally with Transformers.js and
-`nomic-ai/nomic-embed-text-v1.5`; no embedding API key is required. The model
-uses 8-bit weights and downloads from Hugging Face on the first embedding
-request, then remains cached in memory for the lifetime of that server process.
-The server needs network access for the initial download and enough memory and
-CPU to run local inference.
+Document embeddings use Google's `gemini-embedding-001` model through the
+`@google/genai` SDK. Set `GEMINI_API_KEY` in the server environment; never use a
+`NEXT_PUBLIC_` prefix. Uploaded chunk text and search queries are sent to the
+Gemini API for embedding. Document chunks use the `RETRIEVAL_DOCUMENT` task type,
+search queries use `RETRIEVAL_QUERY`, and responses are reduced to 768
+dimensions and L2-normalized before storage.
 
 Stop the app and run this one-time schema and re-embedding step:
 
@@ -125,26 +127,25 @@ npm run dev
 
 The migration adds a 768-dimensional vector column while retaining the old
 1536-dimensional vectors. The one-time re-embedding command rebuilds vectors
-from stored chunk text and only drops the old vectors after every document has
-been re-embedded. Documents and chunk text are preserved; on a fresh database,
-the backfill simply finalizes the 768-dimensional schema without downloading
-the model. UI uploads create embeddings automatically.
+from stored chunk text with Gemini and only drops the old vectors after every
+document has been re-embedded. Ensure `GEMINI_API_KEY` is configured before
+running the command. Documents and chunk text are preserved; on a fresh
+database, the backfill simply finalizes the 768-dimensional schema without
+calling the embedding API. UI uploads create embeddings automatically.
 
 Sign in and open `/documents` (also linked from the chat header).
 
 Upload a PDF, DOCX, Markdown, or UTF-8 TXT file up to 10 MB. The application
 extracts text, shows a preview, splits it into 500-token chunks with 75-token
-overlap, and creates 768-dimensional local embeddings. Markdown and DOCX
+overlap, and creates 768-dimensional Gemini embeddings. Markdown and DOCX
 headings are retained as section metadata; PDF pages are indexed separately.
-Uploaded chunks use the
-`search_document:` task prefix; search requests use `search_query:`. Scanned PDF
-pages are rendered and OCRed locally with Tesseract; install Tesseract with
-English language data (`brew install tesseract` on macOS, or `tesseract-ocr`
-and `tesseract-ocr-eng` on Debian/Ubuntu). Set `TESSERACT_LANG` to a Tesseract
-language code or language combination when needed; it defaults to `eng`. OCR
-has a two-minute processing timeout and does not send documents to an OCR
-service. Each account's documents and search results are scoped to its verified
-server-side session.
+Scanned PDF pages are rendered and OCRed locally with Tesseract; install
+Tesseract with English language data (`brew install tesseract` on macOS, or
+`tesseract-ocr` and `tesseract-ocr-eng` on Debian/Ubuntu). Set `TESSERACT_LANG`
+to a Tesseract language code or language combination when needed; it defaults
+to `eng`. OCR has a two-minute processing timeout and does not send documents
+to an OCR service. Each account's documents and search results are scoped to
+its verified server-side session.
 
 Try a query such as `refund policy` and inspect the returned chunks and source
 metadata. Search is vector-only cosine similarity; answer generation,

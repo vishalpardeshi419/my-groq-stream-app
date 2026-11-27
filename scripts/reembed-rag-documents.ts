@@ -25,7 +25,7 @@ function toVectorLiteral(vector: number[]) {
     vector.length !== RAG_EMBEDDING_DIMENSIONS ||
     vector.some((value) => !Number.isFinite(value))
   ) {
-    throw new Error("The local embedding model returned an invalid vector.");
+    throw new Error("Gemini returned an invalid embedding vector.");
   }
   return `[${vector.join(",")}]`;
 }

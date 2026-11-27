@@ -75,7 +75,7 @@ export async function POST(request: Request) {
     return Response.json(
       {
         error:
-          "Unable to create a local search embedding. Check server logs and retry.",
+          "Unable to create a Gemini search embedding. Check server logs and retry.",
       },
       { status: 503 },
     );
